@@ -30,8 +30,8 @@ class ReportTest(HomeTestCase):
         result, _ = self.scan()
         d = result["disk"]
         self.assertEqual(d["home_measured"], result["measured_bytes"])
-        self.assertEqual(d["outside_home_or_not_measured"],
-                         900 * 1000 ** 3 - result["measured_bytes"])
+        self.assertIsNone(d["outside_measured"])  # --home given: nothing outside is scanned
+        self.assertEqual(d["rest"], 900 * 1000 ** 3 - result["measured_bytes"])
         self.assertEqual(d["not_measured_count"], 1)
         self.assertIn("purgeable", d["note"])
         rc, out = self.run_tool("scan")
@@ -43,23 +43,25 @@ class ReportTest(HomeTestCase):
         self.tool._volume_used = lambda home: None  # diskutil missing: the volume's numbers
         result, _ = self.scan()
         self.assertIsNone(result["disk"]["data_volume_used"])
-        self.assertEqual(result["disk"]["outside_home_or_not_measured"],
+        self.assertEqual(result["disk"]["rest"],
                          result["disk"]["used"] - result["measured_bytes"])
 
     def test_cut_short_scan_lists_what_it_did_not_reach_and_walks_slow_areas_last(self):
         self.write("Library/Caches/com.example.app/blob")
         self.write("Library/Mobile Documents/com~apple~CloudDocs/a/b")
         self.write("Library/CloudStorage/Dropbox/c")
+        self.write("Library/Containers/com.example.guarded/Data/e")
         self.write("Zeta/big", 300 * KB)
         self.write("Documents/d")
-        self.hang("Mobile Documents")
+        self.hang("Mobile Documents", "CloudStorage")
         result, items = self.scan(time_limit=3)
         self.assertFalse(result["complete"])
         reached = {r["rel"]: r["status"] for r in result["not_reached"]}
         self.assertEqual(reached.get("Library/Mobile Documents"), "not started")
         self.assertEqual(reached.get("Library/CloudStorage"), "not started")  # cloud: last
         self.assertTrue(items["Library/Mobile Documents"]["partial"])
-        for rel in ("Library/Caches/com.example.app", "Zeta", "Documents"):  # done first
+        for rel in ("Library/Caches/com.example.app", "Zeta", "Documents",  # done first,
+                    "Library/Containers/com.example.guarded"):  # guarded before cloud
             self.assertGreater(items[rel]["bytes"], 60 * KB, rel)
             self.assertFalse(items[rel]["partial"], rel)
         self.tool.LIST_MIN_BYTES = 0

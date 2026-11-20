@@ -7,6 +7,7 @@ Run `explain` for the plain-words version.
 """
 
 import argparse
+import collections
 import datetime
 import errno
 import fnmatch
@@ -20,6 +21,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import namedtuple
 
@@ -31,6 +33,14 @@ MB = 1000 * 1000
 DEFAULT_TIME_LIMIT = 600  # seconds a scan may run before it reports what it has
 STALL_LIMIT = 20  # seconds one folder may keep macOS silent before it is skipped
 SIBLING_STALL_LIMIT = 5  # the same, for folders next to one that already stalled
+STALLS_PER_PARENT = 3  # after this many stalls in one folder, skip the rest of it
+STALL_BUDGET = 60  # seconds a whole scan may spend waiting on folders that do not answer
+LATE_STALL_LIMIT = 2  # the stall limit once that budget is spent
+WALKERS = 4  # child processes walking at the same time
+FIRST_DEPTH = 2  # the first job lists home and two levels below it
+UNIT_DEPTH = 3  # later jobs walk this many levels, then hand deeper folders back
+UNITS_PER_JOB = 8
+OUTSIDE_TIME_LIMIT = 60  # seconds for the summary of folders outside home
 BIG_UNKNOWN_BYTES = 5 * 1000 * MB  # unknown folders this big get a two-level breakdown
 PROGRESS_EVERY = 3  # seconds between progress lines on stderr
 DEFAULT_CLEAN_DAYS = 30
@@ -318,6 +328,15 @@ def resolve_home(arg):
     return home
 
 
+def outside_root(home_given):
+    """Where the folders outside home are: "/" for the real home folder. With another
+    home (tests, --home) only a root named in the environment, never the real one."""
+    root = os.environ.get(ENV_ROOT)
+    if root:
+        return os.path.realpath(root)
+    return None if home_given else "/"
+
+
 def _xdg(var, home, *default):
     value = os.environ.get(var, "")
     return value if os.path.isabs(value) else os.path.join(home, *default)
@@ -412,6 +431,10 @@ class Item:
                 key = "/".join(rel[depth:depth + 2])
                 self.grandchildren[key] = self.grandchildren.get(key, 0) + size
 
+    def add_files(self, folder, size, changed):
+        """Plain files the walker summed for one folder."""
+        self.add(folder + ("(files)",), size, changed)
+
 
 def _refusal(exc):
     if exc.errno in (errno.ENOENT, errno.ENOTDIR):
@@ -426,6 +449,8 @@ def _refusal(exc):
 NOT_MEASURED_TEXT = {
     "privacy": "macOS privacy protection",
     "no-answer": "macOS did not answer (privacy prompt?)",
+    "skipped-after-stalls": "skipped after macOS did not answer next to it",
+    "skipped-stall-budget": "skipped: macOS kept not answering",
     "permission": "no permission to read it",
     "other-disk": "another disk or volume, not counted",
     "error": "could not be read",
@@ -433,17 +458,19 @@ NOT_MEASURED_TEXT = {
 
 
 # ----------------------------------------------------------------------------- walker
-# Every file-system read of a scan or a clean check happens in a child process (`_walk`).
-# macOS can hold open() on a protected folder while a privacy prompt waits, possibly
-# forever. The parent watches the child: when it sends nothing for the stall limit, the
-# parent stops it, lists that folder as not measured, and goes on with a fresh child.
+# Every file-system read of a scan or a clean check happens in child processes
+# (`_walk`). macOS can hold open() on a protected folder while a privacy prompt waits,
+# possibly forever; the parent watches each child and stops one that goes silent, lists
+# that folder as not measured, and goes on with a fresh child. Several children walk in
+# parallel, which is where the speed comes from: the time goes into file-system calls.
 
-ENV_TEST_HANG = NAME.upper().replace("-", "_") + "_TEST_HANG"  # tests: block on this name
+ENV_TEST_HANG = NAME.upper().replace("-", "_") + "_TEST_HANG"  # tests: block on these names
 _CONTAINS = {name: tuple(m for p in projects for m in p.contains)
              for name, projects in _PROJECT_BY_NAME.items()}
+_MARKER_FILES = {m for p in PROJECT_FOLDERS for m in p.next_to}  # always sent one by one
 
-# Walked after everything else, so a time limit cuts these rather than the rest:
-# 1 = folders macOS usually guards with a privacy prompt, 2 = cloud drives (slow, large).
+# Walked last and one at a time, so a time limit or a row of prompts costs these rather
+# than the rest: 1 = folders macOS usually guards with a privacy prompt, 2 = cloud drives.
 SLOW_AREAS = {
     ("Library", "Containers"): 1, ("Library", "Group Containers"): 1,
     ("Library", "Mail"): 1, ("Library", "Messages"): 1, ("Library", "Safari"): 1,
@@ -457,95 +484,139 @@ def _slow_rank(rel):
     return 1 if rel and rel[-1].endswith(".photoslibrary") else 0
 
 
-def walker_main(home):
-    """The child. Reads its job on stdin and writes one JSON line per folder."""
+def _guarded(rel):
+    """0 for ordinary folders, else the highest slow rank of the folder or one above it."""
+    return max(_slow_rank(rel[:i]) for i in range(len(rel) + 1))
+
+
+def _walks_into(sub, root, lim, skip_slow):
+    """Whether the child walking `root` goes on into `sub`; otherwise the parent queues
+    it. The child and the parent both ask this, so they always agree."""
+    if skip_slow and _slow_rank(sub):
+        return False
+    return lim is None or len(sub) - len(root) <= lim
+
+
+class _Out:
+    """The child's stdout, written in batches. A thread flushes every 50 ms, so the parent
+    still learns which folder the child opened when that open() blocks."""
+
+    def __init__(self):
+        self.parts, self.lock, self.fd = [], threading.Lock(), sys.stdout.fileno()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def send(self, msg):
+        with self.lock:
+            self.parts.append(json.dumps(msg, separators=(",", ":")))
+            full = len(self.parts) >= 512
+        if full:
+            self.flush()
+
+    def flush(self):
+        with self.lock:
+            if not self.parts:
+                return
+            data = ("\n".join(self.parts) + "\n").encode()
+            self.parts = []
+            try:
+                while data:
+                    data = data[os.write(self.fd, data):]
+            except OSError:  # the parent is gone
+                os._exit(1)
+
+    def _loop(self):
+        while True:
+            time.sleep(0.05)
+            self.flush()
+
+
+def walker_main(base):
+    """The child. Reads jobs (one JSON line each) on stdin and writes one JSON line per
+    folder. Plain files deep in the tree are summed per folder; the parent only needs
+    shallow files, hard links and files a catalog row could match one by one."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the parent decides when to stop
-    job = json.loads(sys.stdin.readline())
-    roots = [tuple(r) for r in job["roots"]]
-    root_set = set(roots) if job.get("describe_roots") else set()
-    hang = os.environ.get(ENV_TEST_HANG)
-    dev = os.lstat(home).st_dev
-    out = sys.stdout
-
-    def send(msg, flush=False):
-        out.write(json.dumps(msg, separators=(",", ":")) + "\n")
-        if flush:
-            out.flush()
-
-    stack, later = [], []
-
-    def push(rels):
-        for rel in reversed(rels):
-            rank = _slow_rank(rel)
-            if rank:
-                later.append((rank, len(later), rel))
-            else:
-                stack.append(rel)
-
-    push(roots)
-    while stack or later:
-        if stack:
-            rel = stack.pop()
-        else:
-            later.sort(key=lambda x: (-x[0], -x[1]))
-            rel = later.pop()[2]
-        path = os.path.join(home, *rel)
-        send({"o": rel}, flush=True)  # if open() blocks now, the parent knows where
-        if hang and rel and rel[-1] in hang.split(","):
-            while True:
-                time.sleep(3600)
-        msg = {"d": rel}
-        if rel in root_set:
-            try:
-                st = os.lstat(path)
-            except OSError as exc:
-                msg["err"] = _refusal(exc)
-                send(msg)
-                continue
-            kind = ("link" if stat.S_ISLNK(st.st_mode) else
-                    "dir" if stat.S_ISDIR(st.st_mode) else "file")
-            if kind == "dir" and st.st_dev != dev:
-                kind = "other-disk"
-            msg["self"] = [kind, st.st_blocks * 512, max(st.st_mtime, st.st_ctime)]
-            if kind != "dir":
-                send(msg)
-                continue
-        try:
-            with os.scandir(path) as it:
-                entries = list(it)
-        except OSError as exc:
-            msg["err"] = _refusal(exc)
-            send(msg)
-            continue
-        rows, subdirs = [], []
-        for count, de in enumerate(entries, 1):
-            if count % 1000 == 0:
-                send({"h": rel}, flush=True)
-            try:
-                st = de.stat(follow_symlinks=False)
-            except OSError:
-                continue
-            is_dir = stat.S_ISDIR(st.st_mode)
-            kind = (1 if st.st_dev == dev else 2) if is_dir else 0  # 2: another disk
-            link = [st.st_dev, st.st_ino] if not is_dir and st.st_nlink > 1 else 0
-            markers = 0
-            if kind == 1 and _CONTAINS.get(de.name):
-                markers = [m for m in _CONTAINS[de.name]
-                           if os.path.lexists(os.path.join(de.path, m))]
-            rows.append([de.name, kind, st.st_blocks * 512,
-                         max(st.st_mtime, st.st_ctime), link, markers])
-            if kind == 1:
-                subdirs.append(rel + (de.name,))
-        msg["e"] = rows
-        send(msg)
-        push(subdirs)
-    send({"end": True}, flush=True)
+    hang = set(filter(None, os.environ.get(ENV_TEST_HANG, "").split(",")))
+    dev = os.lstat(base).st_dev
+    out = _Out()
+    for line in sys.stdin:
+        job = json.loads(line)
+        lim, skip_slow, match = job.get("lim"), job.get("skip_slow", True), job.get("match")
+        describe = {tuple(r) for r in job.get("describe", ())}
+        for root in (tuple(r) for r in job["roots"]):
+            stack = [root]
+            while stack:
+                rel = stack.pop()
+                out.send({"o": rel})  # if open() blocks now, the parent knows where
+                if rel and rel[-1] in hang:
+                    while True:
+                        time.sleep(3600)
+                msg = {"d": rel}
+                path = os.path.join(base, *rel)
+                if rel in describe:
+                    try:
+                        st = os.lstat(path)
+                    except OSError as exc:
+                        msg["err"] = _refusal(exc)
+                        out.send(msg)
+                        continue
+                    kind = ("link" if stat.S_ISLNK(st.st_mode) else
+                            "dir" if stat.S_ISDIR(st.st_mode) else "file")
+                    if kind == "dir" and st.st_dev != dev:
+                        kind = "other-disk"
+                    msg["self"] = [kind, st.st_blocks * 512, max(st.st_mtime, st.st_ctime)]
+                    if kind != "dir":
+                        out.send(msg)
+                        continue
+                rows, subdirs, files = [], [], [0, 0.0, 0]
+                try:
+                    with os.scandir(path) as it:
+                        for count, de in enumerate(it, 1):
+                            if count % 1000 == 0:
+                                out.send({"h": 1})
+                            try:
+                                st = de.stat(follow_symlinks=False)
+                            except OSError:
+                                continue
+                            size = st.st_blocks * 512
+                            newest = st.st_mtime if st.st_mtime > st.st_ctime else st.st_ctime
+                            if stat.S_ISDIR(st.st_mode):
+                                kind = 1 if st.st_dev == dev else 2  # 2: another disk
+                                markers = 0
+                                if kind == 1 and de.name in _CONTAINS:
+                                    markers = [m for m in _CONTAINS[de.name]
+                                               if os.path.lexists(os.path.join(de.path, m))]
+                                rows.append([de.name, kind, size, newest, 0, markers])
+                                if kind == 1:
+                                    subdirs.append(rel + (de.name,))
+                            elif (st.st_nlink > 1 or len(rel) < 3 or de.name in _MARKER_FILES
+                                  or (match and match_path(rel + (de.name,)))):
+                                link = [st.st_dev, st.st_ino] if st.st_nlink > 1 else 0
+                                rows.append([de.name, 0, size, newest, link, 0])
+                            else:
+                                files[0] += size
+                                files[2] += 1
+                                if newest > files[1]:
+                                    files[1] = newest
+                except OSError as exc:
+                    msg["err"] = _refusal(exc)
+                    out.send(msg)
+                    continue
+                msg["e"] = rows
+                if files[2]:
+                    msg["f"] = files
+                out.send(msg)
+                for sub in reversed(subdirs):
+                    if _walks_into(sub, root, lim, skip_slow):
+                        stack.append(sub)
+        out.send({"done": True})
+        out.flush()
+    out.flush()
     return 0
 
 
 def _stop(proc):
     if proc.poll() is None:
-        proc.kill()  # only ever the child this process started
+        proc.kill()  # only ever a child this process started
     proc.wait()
     for stream in (proc.stdin, proc.stdout):
         if stream:
@@ -555,93 +626,200 @@ def _stop(proc):
                 pass
 
 
-def walk(home, roots, on_listing, time_limit, stall_limit, describe_roots=False,
-         on_no_answer=None, on_progress=None):
-    """Walk folders in child processes, never touching the file system here.
+class _Walker:
+    """One child process and what it is doing."""
+
+    def __init__(self, base, sel):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-I", os.path.realpath(__file__), "_walk", base],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        self.fd, self.buf, self.sel = self.proc.stdout.fileno(), b"", sel
+        self.busy, self.pending, self.current, self.last = False, {}, None, 0.0
+        self.lim, self.skip_slow = None, True
+        sel.register(self.fd, selectors.EVENT_READ, self)
+
+    def start(self, roots, lim, skip_slow, describe, match):
+        job = {"roots": [list(r) for r in roots], "lim": lim, "skip_slow": skip_slow,
+               "describe": [list(r) for r in roots if r in describe], "match": match}
+        data = (json.dumps(job) + "\n").encode()
+        while data:
+            data = data[os.write(self.proc.stdin.fileno(), data):]
+        self.busy, self.lim, self.skip_slow = True, lim, skip_slow
+        self.pending = {r: r for r in roots}  # folder -> the job root it belongs to
+        self.current, self.last = None, time.monotonic()
+
+    def close(self):
+        try:
+            self.sel.unregister(self.fd)
+        except (KeyError, ValueError):
+            pass
+        _stop(self.proc)
+
+
+def walk(base, roots, on_listing, time_limit, stall_limit, describe=False, skip_slow=True,
+         match=False, first_lim=None, workers=None, on_no_answer=None, on_skipped=None,
+         on_progress=None):
+    """Walk folders under `base` in child processes; never touch the file system here.
 
     roots: {rel: ctx}. on_listing(rel, ctx, msg) returns {name: ctx} for subfolders.
-    on_no_answer(rel, ctx, why, waited) is called for a folder the child got stuck on
-    (why: "no-answer") or died on ("error"); the walk goes on without it. Once a folder
-    stalls, its siblings get SIBLING_STALL_LIMIT, so a row of guarded folders stays cheap.
-    Returns (cut, pending): cut is True when the time limit (or a stuck child outside any
-    folder) ended the walk early; pending maps the folders not walked to their ctx.
+    on_no_answer(rel, ctx, why, waited): a folder a child got stuck on ("no-answer") or
+    died on ("error"). on_skipped(parent, [(rel, ctx)], why): folders given up without
+    trying, after STALLS_PER_PARENT stalls next to them ("parent") or once stalls used up
+    STALL_BUDGET ("budget"). Returns (cut, pending): cut is True when the time limit ended
+    the walk; pending maps every folder not walked to its ctx.
     """
     deadline = time.monotonic() + time_limit
-    pending = dict(roots)
-    stalled_parents = set()
+    workers = workers or WALKERS
+    ctxs = dict(roots)  # every folder known but not listed yet
+    describe = set(roots) if describe else set()
+    normal, guarded = collections.deque(), collections.deque()
+    stalls, state = {}, {"spent": 0.0, "failures": 0}
+    walkers = []
+    sel = selectors.DefaultSelector()
 
-    def limit_for(rel):
-        if rel is not None and rel[:-1] in stalled_parents:
-            return min(stall_limit, SIBLING_STALL_LIMIT)
-        return stall_limit
+    def queue(rel, lim):
+        (guarded if skip_slow and _guarded(rel) else normal).append((rel, lim))
 
-    script = os.path.realpath(__file__)
-    while pending:
-        if time.monotonic() >= deadline:
-            return True, pending
-        proc = subprocess.Popen([sys.executable, "-I", script, "_walk", home],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
-        current, finished, stalled = None, False, False
-        try:
-            job = {"roots": [list(r) for r in pending], "describe_roots": describe_roots}
-            try:
-                proc.stdin.write((json.dumps(job) + "\n").encode())
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
-            fd = proc.stdout.fileno()
-            with selectors.DefaultSelector() as sel:
-                sel.register(fd, selectors.EVENT_READ)
-                buf, last = b"", time.monotonic()
-                while not finished:
-                    now = time.monotonic()
-                    if now >= deadline:
-                        return True, pending
-                    limit = limit_for(current)
-                    if now - last >= limit:
-                        stalled = True
-                        break
-                    if on_progress:
-                        on_progress(current)
-                    if not sel.select(min(deadline - now, last + limit - now, 1.0)):
-                        continue
-                    chunk = os.read(fd, 1 << 16)
-                    if not chunk:
-                        break  # the child exited
-                    last = time.monotonic()
-                    *lines, buf = (buf + chunk).split(b"\n")
-                    for line in lines:
-                        msg = json.loads(line)
-                        if "o" in msg:
-                            current = tuple(msg["o"])
-                        elif "d" in msg:
-                            rel = tuple(msg["d"])
-                            subs = on_listing(rel, pending.pop(rel, None), msg) or {}
-                            for row in msg.get("e") or ():
-                                if row[1] == 1:
-                                    pending[rel + (row[0],)] = subs.get(row[0])
-                            current = None
-                        elif "end" in msg:
-                            finished = True
-        finally:
-            _stop(proc)
-        if finished:
-            break
-        if current is None or current not in pending:
-            return True, pending  # stuck outside any folder: give up rather than loop
-        ctx = pending.pop(current)
-        waited = limit_for(current)
+    for rel in roots:
+        queue(rel, first_lim)
+
+    def limit_for(w):
+        limit = stall_limit
+        if w.current is not None and w.current[:-1] in stalls:
+            limit = min(limit, SIBLING_STALL_LIMIT)
+        return min(limit, max(LATE_STALL_LIMIT, STALL_BUDGET - state["spent"]))
+
+    def idle_walker():
+        for w in walkers:
+            if not w.busy:
+                return w
+        if len(walkers) < workers:
+            walkers.append(_Walker(base, sel))
+            return walkers[-1]
+        return None
+
+    def dispatch():
+        while normal:
+            w = idle_walker()
+            if w is None:
+                return
+            rel, lim = normal.popleft()
+            batch = [rel]
+            while normal and len(batch) < UNITS_PER_JOB and normal[0][1] == lim:
+                batch.append(normal.popleft()[0])
+            w.start(batch, lim, skip_slow, describe, match)
+        if guarded and not any(w.busy for w in walkers):  # last, one at a time
+            nxt = min(guarded, key=lambda unit: (_guarded(unit[0]), unit[0]))
+            guarded.remove(nxt)
+            idle_walker().start([nxt[0]], None, skip_slow, describe, match)
+
+    def skip(parent, why, test):
+        dropped = []
+        for q in (normal, guarded):
+            keep = [(r, lim) for r, lim in q if not test(r)]
+            dropped += [r for r, _ in q if test(r)]
+            q.clear()
+            q.extend(keep)
+        groups = {}
+        for r in dropped:
+            groups.setdefault(parent if parent is not None else r[:-1], []).append(
+                (r, ctxs.pop(r, None)))
+        for p, rows in groups.items():
+            if on_skipped:
+                on_skipped(p, rows, why)
+
+    def give_up(w, stalled):
+        waited = limit_for(w)
+        stuck = w.current
+        w.close()
+        walkers.remove(w)
+        for rel in w.pending:
+            if rel != stuck:
+                queue(rel, UNIT_DEPTH)
+        if stuck is None or stuck not in ctxs:
+            state["failures"] += 1  # silent outside any folder: retry, but not forever
+            return state["failures"] <= 3
+        ctx = ctxs.pop(stuck)
         if stalled:
-            stalled_parents.add(current[:-1])
+            state["spent"] += waited
+            parent = stuck[:-1]
+            stalls[parent] = stalls.get(parent, 0) + 1
         if on_no_answer:
-            on_no_answer(current, ctx, "no-answer" if stalled else "error", waited)
-    return False, pending
+            on_no_answer(stuck, ctx, "no-answer" if stalled else "error", waited)
+        if stalled and stalls[stuck[:-1]] >= STALLS_PER_PARENT:
+            parent = stuck[:-1]
+            skip(parent, "parent", lambda r: r[:-1] == parent)
+        if state["spent"] >= STALL_BUDGET:
+            skip(None, "budget", lambda r: _guarded(r))
+        return True
+
+    def handle(w, msg):
+        if "o" in msg:
+            w.current = tuple(msg["o"])
+        elif "d" in msg:
+            rel = tuple(msg["d"])
+            root = w.pending.pop(rel, rel)
+            subs = on_listing(rel, ctxs.pop(rel, None), msg) or {}
+            for row in msg.get("e") or ():
+                if row[1] == 1:
+                    sub = rel + (row[0],)
+                    ctxs[sub] = subs.get(row[0])
+                    if _walks_into(sub, root, w.lim, w.skip_slow):
+                        w.pending[sub] = root
+                    else:
+                        queue(sub, UNIT_DEPTH)
+            w.current = None
+        elif "done" in msg:
+            for rel in w.pending:  # nothing should be left; requeue to be safe
+                queue(rel, UNIT_DEPTH)
+            w.busy, w.pending, w.current = False, {}, None
+
+    cut = False
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                cut = True
+                break
+            dispatch()
+            busy = [w for w in walkers if w.busy]
+            if not busy:
+                break
+            wait = min([1.0, deadline - now] + [w.last + limit_for(w) - now for w in busy])
+            dead = set()
+            for key, _ in sel.select(max(0.0, wait)):
+                w = key.data
+                chunk = os.read(w.fd, 1 << 20)
+                if not chunk:
+                    dead.add(w)
+                    continue
+                w.last = time.monotonic()
+                *lines, w.buf = (w.buf + chunk).split(b"\n")
+                for line in lines:
+                    handle(w, json.loads(line))
+            now = time.monotonic()
+            for w in busy:
+                if w in dead or (w.busy and now - w.last >= limit_for(w)):
+                    if not give_up(w, stalled=w not in dead):
+                        cut = True
+                        break
+            if cut:
+                break
+            if on_progress:
+                on_progress(next((w.current for w in walkers if w.busy and w.current), None))
+    finally:
+        for w in walkers:
+            w.close()
+        sel.close()
+    return cut, ctxs
 
 
-def scan_home(home, time_limit, stall_limit=None, progress=False):
-    """Walk the home folder once (in child processes). Returns the full result."""
+def scan_home(home, time_limit, stall_limit=None, progress=False, root=None):
+    """Walk the home folder once (in child processes), then, with `root`, the folders
+    outside it. `time_limit` covers both. Returns the full result."""
     stall_limit = STALL_LIMIT if stall_limit is None else stall_limit
     started, t0 = _now(), time.monotonic()
+    outside_budget = min(OUTSIDE_TIME_LIMIT, time_limit * 0.1) if root else 0
     items, unknown, not_measured, seen, no_answer = {}, {}, [], set(), []
     stats = {"folders": 0, "bytes": 0, "shown": t0}
 
@@ -650,12 +828,16 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
             unknown[name] = Item((name,), UNKNOWN)
         return unknown[name]
 
-    def blocked(rel, owner, reason):
+    def mark(rel, owner):
         target = owner if owner is not None else anchor(rel[0])
         if target.rel == rel:
             target.unreadable = True
         else:
             target.partial = True
+        return target
+
+    def blocked(rel, owner, reason):
+        target = mark(rel, owner)
         row = {"rel": "/".join(rel), "reason": reason}
         if target.rel == rel and target.entry is not UNKNOWN:
             row["id"] = target.entry.id
@@ -697,6 +879,10 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
             stats["bytes"] += size
             if kind == 1:
                 subs[name] = child_owner
+        if "f" in msg:  # plain files summed by the child
+            size, newest, _count = msg["f"]
+            (owner if owner is not None else anchor(rel[0])).add_files(rel, size, newest)
+            stats["bytes"] += size
         return subs
 
     def on_no_answer(rel, owner, why, waited):
@@ -707,6 +893,15 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
                     if why == "no-answer" else "could not be read")
             print(f"  {_short(rel)}: {text}; skipping it", file=sys.stderr, flush=True)
 
+    def on_skipped(parent, rows, why):
+        for rel, owner in rows:
+            mark(rel, owner)
+        reason = "skipped-after-stalls" if why == "parent" else "skipped-stall-budget"
+        not_measured.append({"rel": "/".join(parent), "reason": reason, "count": len(rows)})
+        if progress:
+            print(f"  {_short(parent)}: {_skipped_text(reason, len(rows))}",
+                  file=sys.stderr, flush=True)
+
     def on_progress(current):
         now = time.monotonic()
         if now - stats["shown"] >= PROGRESS_EVERY:
@@ -715,8 +910,10 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
             print(f"  scanning {where}  ({stats['folders']} folders, "
                   f"{fmt_bytes(stats['bytes'])} so far)", file=sys.stderr, flush=True)
 
-    timed_out, pending = walk(home, {(): None}, on_listing, time_limit, stall_limit,
-                              on_no_answer=on_no_answer,
+    timed_out, pending = walk(home, {(): None}, on_listing, time_limit - outside_budget,
+                              stall_limit,
+                              match=True, first_lim=FIRST_DEPTH,
+                              on_no_answer=on_no_answer, on_skipped=on_skipped,
                               on_progress=on_progress if progress else None)
 
     # What the time limit left out: the items concerned are only partly measured.
@@ -743,11 +940,21 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
     if timed_out:
         reasons.append(f"stopped after the time limit ({_duration(time_limit)}); "
                        "sizes are at least what is shown")
-    if no_answer:
-        reasons.append(f"macOS did not answer for {len(no_answer)} folder"
-                       f"{'s' if len(no_answer) != 1 else ''} (privacy prompt?); "
-                       "listed as not measured")
+    skipped = sum(r.get("count", 0) for r in not_measured if r["reason"].startswith("skipped"))
+    if no_answer or skipped:
+        text = (f"macOS did not answer for {len(no_answer)} folder"
+                f"{'s' if len(no_answer) != 1 else ''} (privacy prompt?)")
+        if skipped:
+            text += f" and {skipped} more next to them were skipped"
+        reasons.append(text + "; listed as not measured")
     measured = sum(r["bytes"] for r in records)
+    outside = {"scanned": False}
+    if root:
+        left = time_limit - (time.monotonic() - t0)
+        if progress:
+            print("  outside your home folder: sizes only", file=sys.stderr, flush=True)
+        outside = scan_outside(root, home, max(0.0, left), stall_limit)
+    missing = sum(r.get("count", 1) for r in not_measured if r["reason"] != "other-disk")
     return {
         "tool": NAME,
         "version": VERSION,
@@ -758,12 +965,133 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
         "complete": not reasons,
         "timed_out": timed_out,
         "incomplete_reason": "; ".join(reasons) or None,
-        "disk": disk_numbers(home, measured, len(not_measured)),
+        "disk": disk_numbers(home, measured, missing,
+                             outside["bytes"] if outside["scanned"] else None),
         "measured_bytes": measured,
+        "outside": outside,
         "not_reached": not_reached,
         "kinds": {k: sum(r["bytes"] for r in records if r["kind"] == k) for k in KINDS},
         "not_measured": sorted(not_measured, key=lambda r: r["rel"]),
         "items": records,
+    }
+
+
+def _skipped_text(reason, count):
+    many = f"{count} folder{'s' if count != 1 else ''}"
+    if reason == "skipped-after-stalls":
+        return (f"{count} more folder{'s' if count != 1 else ''} skipped after macOS did not "
+                f"answer for {STALLS_PER_PARENT} of them")
+    return f"{many} skipped: macOS kept not answering ({_duration(STALL_BUDGET)} spent waiting)"
+
+
+# ----------------------------------------------------------------------------- outside home
+
+ENV_ROOT = NAME.upper().replace("-", "_") + "_ROOT"  # tests: a stand-in for "/"
+OUTSIDE = [  # folders outside the home folder, measured read-only, never cleaned
+    ("Applications", "Apps for every account on this Mac."),
+    ("Library", "System-wide app data, caches and support files."),
+    ("Users/Shared", "The folder every account on this Mac shares."),
+    ("private/var", "System data: logs, caches, swap (only what your account may read)."),
+    ("opt", "Homebrew on Apple silicon, and other tools in /opt."),
+    ("usr/local", "Homebrew on Intel Macs, and other tools in /usr/local."),
+]
+
+
+def _snapshot_count(root):
+    """Local Time Machine snapshots on the start-up disk, or None."""
+    if root != "/":
+        return None
+    try:
+        out = subprocess.run(["tmutil", "listlocalsnapshots", "/"], capture_output=True,
+                             text=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return sum(1 for line in out.stdout.splitlines() if "com.apple" in line)
+
+
+def scan_outside(root, home, time_limit, stall_limit, progress=False):
+    """Sizes of the OUTSIDE folders, other accounts by name only, local snapshots."""
+    t0 = time.monotonic()
+    found = {}
+    for rel_text, description in OUTSIDE:
+        rel = tuple(rel_text.split("/"))
+        path = os.path.join(root, *rel)
+        if os.path.isdir(path) and not os.path.islink(path):
+            found[rel] = {"path": "/" + rel_text, "description": description, "bytes": 0,
+                          "partial": False, "not_measured": 0, "children": {}}
+    seen = set()
+
+    def on_listing(rel, loc, msg):
+        m = found[loc]
+        if "self" in msg:
+            m["bytes"] += msg["self"][1]
+        if "err" in msg:
+            if msg["err"] != "gone":
+                m["not_measured"] += 1
+                m["partial"] = True
+            return {}
+        subs, depth = {}, len(loc)
+        for name, kind, size, _newest, link, _ in msg.get("e") or ():
+            if kind == 2:
+                continue
+            if link:
+                key = tuple(link)
+                size = 0 if key in seen else size
+                seen.add(key)
+            m["bytes"] += size
+            key = (rel + (name,))[depth]
+            m["children"][key] = m["children"].get(key, 0) + size
+            if kind == 1:
+                subs[name] = loc
+        if "f" in msg:
+            m["bytes"] += msg["f"][0]
+            key = rel[depth] if len(rel) > depth else "(files)"
+            m["children"][key] = m["children"].get(key, 0) + msg["f"][0]
+        return subs
+
+    def on_no_answer(rel, loc, why, waited):
+        if loc in found:
+            found[loc]["not_measured"] += 1
+            found[loc]["partial"] = True
+
+    def on_skipped(parent, rows, why):
+        for _rel, loc in rows:
+            if loc in found:
+                found[loc]["not_measured"] += 1
+                found[loc]["partial"] = True
+
+    cut, pending = walk(root, {rel: rel for rel in found}, on_listing, time_limit,
+                        min(stall_limit, SIBLING_STALL_LIMIT), describe=True, skip_slow=False,
+                        first_lim=UNIT_DEPTH, on_no_answer=on_no_answer,
+                        on_skipped=on_skipped)
+    for loc in pending.values():
+        if loc in found:
+            found[loc]["partial"] = True
+
+    users = os.path.join(root, "Users")
+    mine = os.path.basename(home) if os.path.dirname(home) == os.path.realpath(users) else None
+    accounts = []
+    try:
+        with os.scandir(users) as it:  # names only: never look inside another account
+            accounts = sorted(de.name for de in it if de.name not in ("Shared", mine)
+                              and not de.name.startswith(".") and de.is_dir(follow_symlinks=False))
+    except OSError:
+        pass
+    locations = []
+    for m in sorted(found.values(), key=lambda m: -m["bytes"]):
+        top = sorted(m.pop("children").items(), key=lambda kv: -kv[1])[:3]
+        m["biggest_inside"] = [{"name": k, "bytes": v} for k, v in top if v > 0]
+        locations.append(m)
+    return {
+        "scanned": True,
+        "complete": not cut,
+        "seconds": round(time.monotonic() - t0, 1),
+        "bytes": sum(m["bytes"] for m in locations),
+        "locations": locations,
+        "other_accounts": accounts,
+        "local_snapshots": _snapshot_count(root),
     }
 
 
@@ -824,7 +1152,9 @@ def _volume_used(home):
         return None
 
 
-def disk_numbers(home, measured, not_measured_count):
+def disk_numbers(home, measured, not_measured_count, outside=None):
+    """used (the data volume, else the whole disk) = home_measured + outside_measured
+    + rest. Without an outside summary, rest is everything outside home too."""
     usage = shutil.disk_usage(home)
     volume_used = _volume_used(home)
     used = volume_used if volume_used is not None else usage.used
@@ -834,7 +1164,8 @@ def disk_numbers(home, measured, not_measured_count):
         "used": usage.used,
         "data_volume_used": volume_used,
         "home_measured": measured,
-        "outside_home_or_not_measured": max(0, used - measured),
+        "outside_measured": outside,
+        "rest": max(0, used - measured - (outside or 0)),
         "system_and_other_volumes": (max(0, usage.used - volume_used)
                                      if volume_used is not None else None),
         "not_measured_count": not_measured_count,
@@ -914,6 +1245,7 @@ def scan_view(result, changes, top):
         }
     blocked = result["not_measured"]
     view = {k: v for k, v in result.items() if k not in ("items", "kinds", "not_measured")}
+    view["outside"] = result.get("outside", {"scanned": False})
     view["kinds"] = kinds
     view["not_measured"] = blocked[:NOT_MEASURED_TOP]
     view["not_measured_total"] = len(blocked)
@@ -977,14 +1309,46 @@ def render_scan(result, changes):
         out.append("")
         out.append("Not measured (never counted as empty):")
         for r in blocked[:8]:
-            out.append(f"  {disp(r['rel'])}: {NOT_MEASURED_TEXT[r['reason']]}")
+            text = (_skipped_text(r["reason"], r["count"]) if r["reason"].startswith("skipped")
+                    else NOT_MEASURED_TEXT[r["reason"]])
+            out.append(f"  {disp(r['rel'])}: {text}")
         if len(blocked) > 8:
             out.append(f"  ... and {len(blocked) - 8} more")
         if any(r["reason"] in ("privacy", "no-answer") for r in blocked):
             out.append("  " + FDA_HINT)
+    out.extend(render_outside(result.get("outside") or {}))
     out.append("")
     out.extend(render_changes(changes))
     return "\n".join(out)
+
+
+def render_outside(o):
+    if not o.get("scanned"):
+        return []
+    head = "Outside your home folder (sizes only; nothing here is ever cleaned)"
+    if not o["complete"]:
+        head += f", stopped after {_duration(o['seconds'])}: sizes are at least these"
+    out = ["", head + ":"]
+    for m in o["locations"]:
+        if m["bytes"] < LIST_MIN_BYTES and not m["not_measured"]:
+            continue
+        size = ("at least " if m["partial"] else "") + fmt_bytes(m["bytes"])
+        out.append(f"  {size:>10}  {m['path']}  {m['description']}")
+        extra = []
+        if m["biggest_inside"]:
+            extra.append("biggest inside: " + ", ".join(
+                f"{c['name']} {fmt_bytes(c['bytes'])}" for c in m["biggest_inside"]))
+        if m["not_measured"]:
+            extra.append(f"{m['not_measured']} folder{'s' if m['not_measured'] != 1 else ''} "
+                         "your account may not read")
+        for line in extra:
+            out.append(f"  {'':>10}  {line}")
+    for name in o["other_accounts"]:
+        out.append(f"  another account: {name} (not measured: only that account can look)")
+    if o.get("local_snapshots") is not None:
+        out.append(f"  Local Time Machine snapshots: {o['local_snapshots']} (macOS removes "
+                   "them by itself when space runs low)")
+    return out
 
 
 def render_disk(d):
@@ -993,11 +1357,18 @@ def render_disk(d):
     used = d["data_volume_used"] if d.get("data_volume_used") is not None else d["used"]
     where = "Your data uses" if d.get("data_volume_used") is not None else "Used"
     missing = d.get("not_measured_count", 0)
-    tail = (f" or in the {missing} folder{'s' if missing != 1 else ''} not measured"
-            if missing else "")
-    lines.append(f"{where} {fmt_bytes(used)}: {fmt_bytes(d['home_measured'])} measured in your "
-                 f"home folder, {fmt_bytes(d['outside_home_or_not_measured'])} outside it "
-                 f"(apps, macOS data, other user accounts){tail}.")
+    folders = f"{missing} folder{'s' if missing != 1 else ''} not measured"
+    if d.get("outside_measured") is None:
+        tail = f" or in the {folders}" if missing else ""
+        lines.append(f"{where} {fmt_bytes(used)}: {fmt_bytes(d['home_measured'])} measured in "
+                     f"your home folder, {fmt_bytes(d['rest'])} outside it (apps, macOS data, "
+                     f"other user accounts){tail}.")
+    else:
+        lines.append(f"{where} {fmt_bytes(used)} = {fmt_bytes(d['home_measured'])} in your home "
+                     f"folder + {fmt_bytes(d['outside_measured'])} in the folders outside it "
+                     f"listed below + {fmt_bytes(d['rest'])} not measured (other accounts, "
+                     f"system data your account may not read"
+                     + (f", the {folders}" if missing else "") + ").")
     if d.get("system_and_other_volumes"):
         lines.append(f"macOS itself, swap and snapshots use another "
                      f"{fmt_bytes(d['system_and_other_volumes'])}.")
@@ -1035,7 +1406,8 @@ def cmd_scan(args, home):
         print(f"Scanning {home} (sizes only; stops after {_duration(args.time_limit)} at most)",
               file=sys.stderr, flush=True)
     prev = latest_scan(home)
-    result = scan_home(home, args.time_limit, args.stall_limit, progress=not args.json)
+    result = scan_home(home, args.time_limit, args.stall_limit, progress=not args.json,
+                       root=outside_root(args.home is not None or ENV_HOME in os.environ))
     changes = diff_scans(prev, result)
     save_scan(home, result)
     if args.json:
@@ -1251,14 +1623,22 @@ def measure_many(home, rels, time_limit, stall_limit):
                 m["newest"] = max(m["newest"], newest)
                 if kind == 1:
                     subs[name] = root
+            if "f" in msg:
+                m["bytes"] += msg["f"][0]
+                m["newest"] = max(m["newest"], msg["f"][1])
             return subs
 
         def on_no_answer(rel, root, why, _waited):
             res[root]["no_answer" if why == "no-answer" else "unreadable"] = True
 
+        def on_skipped(_parent, rows, _why):
+            for _rel, root in rows:
+                res[root]["no_answer"] = True
+
         timed_out, _pending = walk(home, {r: r for r in batch}, on_listing,
-                         max(0.0, deadline - time.monotonic()), stall_limit,
-                         describe_roots=True, on_no_answer=on_no_answer)
+                                   max(0.0, deadline - time.monotonic()), stall_limit,
+                                   describe=True, skip_slow=False, on_no_answer=on_no_answer,
+                                   on_skipped=on_skipped)
         if timed_out:
             for r in batch + todo:
                 res[r]["timeout"] = True
@@ -1600,6 +1980,10 @@ What it does
              user     your own files: Documents, Desktop, Downloads, Pictures, Movies, Music
              unknown  anything else that is big: you judge these
            It keeps the result, so the next scan can say what is new or has grown.
+           It also adds up, read-only, the big folders outside your home folder
+           (/Applications, /Library, /Users/Shared, /private/var, /opt, /usr/local),
+           names other accounts without looking inside them, and counts local Time
+           Machine snapshots. Nothing outside your home folder is ever cleaned.
   policy   One small file with your rules, per kind or per item: keep, ask, or clean
            when nothing in it changed for a number of days.
   clean    Lists exactly what your rules would remove and how much that frees.
@@ -1609,7 +1993,8 @@ What it never does
   - It never opens or reads your files: it looks at sizes and dates only.
   - It never uses the network and sends nothing anywhere.
   - It never removes your own files (user) or anything it does not recognise (unknown).
-  - It never removes anything outside your home folder, never follows links out of it,
+  - It never opens another account's folder, and never removes anything outside your
+    home folder; it never follows links out of it,
     and never touches a git project with uncommitted or unpushed work.
   - It never runs by itself: there is no background job unless you set one up.
 
@@ -1627,15 +2012,17 @@ How cleaning works
 Privacy prompts and time limits
   macOS may ask whether your terminal may access Documents, Desktop or other apps' data.
   While such a prompt waits, macOS holds the folder; if nobody answers within {stall},
-  the tool skips that folder and goes on (folders next to it get {sibling}). Folders
-  macOS usually guards, and cloud drives, are scanned last. Folders macOS keeps closed or holds are shown
+  the tool skips that folder and goes on (folders next to it get {sibling}; after three
+  in one folder it skips the rest of that folder; waiting never adds up to more than
+  {budget} per scan). Folders macOS usually guards, and cloud drives, are scanned last. Folders macOS keeps closed or holds are shown
   as "not measured", never as empty. To measure them, give your terminal app Full Disk
   Access (System Settings > Privacy & Security).
 
 A scan takes a few minutes, prints which folder it is in every few seconds (never file
 names), and stops after {limit} at most, reporting what it measured and what it did
-not reach. The disk line shows how much of the used space is in your home folder; the
-rest is apps, macOS data and other user accounts, which it does not scan.
+not reach. The disk line splits the used space into your home folder, the folders
+outside it listed in the report, and the rest it could not measure (other accounts,
+system data your account may not read).
 """
 
 
@@ -1643,7 +2030,8 @@ def cmd_explain(args, home):
     print(EXPLAIN.format(name=NAME, policy=policy_path(home), state=state_dir(home),
                          tool=tool_dir(), limit=_duration(DEFAULT_TIME_LIMIT),
                          stall=_duration(STALL_LIMIT),
-                         sibling=_duration(SIBLING_STALL_LIMIT)))
+                         sibling=_duration(SIBLING_STALL_LIMIT),
+                         budget=_duration(STALL_BUDGET)))
     last = latest_scan(home)
     if last is None:
         print("Last scan: never")

@@ -47,6 +47,20 @@ looking inside them, and counts local Time Machine snapshots. Nothing outside yo
 folder is ever offered for cleaning. To measure those folders, give your terminal
 app Full Disk Access in System Settings › Privacy & Security.
 
+## Private folders
+
+If a folder holds work whose contents must not show up anywhere, such as an employer's
+checkout or client files, mark it private (Claude asks on the first run):
+
+```sh
+~/.local/share/disk-tool/bin/disk-tool private add ~/Developer/Acme
+```
+
+The report then shows that folder as one line, its path and total size. Nothing inside it
+is listed, matched, saved with the scan, shown while scanning, or ever cleaned, and
+marking it also removes what earlier saved scans recorded inside it. `private list` shows
+them and `private remove` undoes one. They live in `~/.config/disk-tool/private.json`.
+
 ## What it never does
 
 - Open or read your files. It looks at sizes and dates only.

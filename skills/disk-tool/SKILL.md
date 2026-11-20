@@ -16,6 +16,12 @@ other cleaners. Everything goes through the tool.
    tell the user in at most five plain lines how it works (what it measures, what it never
    does, that macOS may ask for access to some folders, that the scan takes a few
    minutes). Otherwise skip the explanation.
+   On the first run, before the first scan, ask once: "Is there a folder whose contents
+   must not show up, such as an employer's code or client work?" For each one they name,
+   run `disk-tool private add <path>`. The report then shows only that folder's path
+   and total size. Never look inside a private folder yourself (no `ls`, `du`, `find`),
+   and never guess what it holds. `disk-tool private list` shows them;
+   `disk-tool private add` works any time later too.
 2. Run `disk-tool scan --json --time-limit 540` (give the shell call a 10-minute timeout).
    Never pass `--home`: that is for tests. macOS may show the user a prompt asking whether
    the terminal may open a folder; tell them before the scan that they can answer it or

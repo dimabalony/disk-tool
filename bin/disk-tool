@@ -63,9 +63,10 @@ KINDS = {
     "dev": "Developer files and tools",
     "apps": "App data and settings",
     "user": "Your files",
+    "private": "Private folders: total size only, nothing inside is listed",
     "unknown": "Not in the catalog: you judge these",
 }
-NEVER_CLEAN = ("user", "unknown")
+NEVER_CLEAN = ("user", "private", "unknown")
 
 RETURNS = {
     "auto": "comes back by itself",
@@ -267,8 +268,10 @@ PROJECT_FOLDERS = [
 
 UNKNOWN = E("unknown", "unknown", "*", "no",
             "Not in the catalog. Look at it and decide yourself.")
+PRIVATE = E("private", "private", "*", "no",
+            "Private folder: only its total size is measured; nothing inside is listed.")
 
-ENTRIES = {e.id: e for e in CATALOG + [p.entry for p in PROJECT_FOLDERS] + [UNKNOWN]}
+ENTRIES = {e.id: e for e in CATALOG + [p.entry for p in PROJECT_FOLDERS] + [UNKNOWN, PRIVATE]}
 
 _BY_KEY = {}
 for _e in CATALOG:
@@ -346,6 +349,25 @@ def policy_path(home):
     return os.path.join(_xdg("XDG_CONFIG_HOME", home, ".config"), NAME, "policy.json")
 
 
+def private_path(home):
+    return os.path.join(_xdg("XDG_CONFIG_HOME", home, ".config"), NAME, "private.json")
+
+
+def load_private(home):
+    """Private folders, as paths under home ("Developer/Acme")."""
+    data = _read_json(private_path(home)) or {}
+    folders = data.get("folders", []) if isinstance(data, dict) else []
+    return sorted({f for f in folders if isinstance(f, str) and f and not f.startswith("/")})
+
+
+def _inside(rel, folders):
+    """The private folder `rel` is in (or is), else None. rel and folders: "a/b" strings."""
+    for f in folders:
+        if rel == f or rel.startswith(f + "/"):
+            return f
+    return None
+
+
 def state_dir(home):
     return os.path.join(_xdg("XDG_STATE_HOME", home, ".local", "state"), NAME)
 
@@ -410,7 +432,7 @@ def days_since(t, now=None):
 
 class Item:
     __slots__ = ("rel", "entry", "bytes", "newest", "partial", "unreadable", "children",
-                 "grandchildren")
+                 "grandchildren", "private_children")
 
     def __init__(self, rel, entry):
         self.rel, self.entry = rel, entry
@@ -418,6 +440,7 @@ class Item:
         self.partial = self.unreadable = False
         self.children = {}
         self.grandchildren = {} if entry is UNKNOWN else None
+        self.private_children = []  # private folders inside: shown as one entry each
 
     def add(self, rel, size, changed):
         self.bytes += size
@@ -530,6 +553,39 @@ class _Out:
             self.flush()
 
 
+def _private_total(path, dev, out, hang):
+    """Total allocated size under a private folder, and how many folders in it could not
+    be read. Nothing about what is inside leaves this function."""
+    total, unread, seen, stack, count = 0, 0, set(), [path], 0
+    while stack:
+        p = stack.pop()
+        if hang and os.path.basename(p) in hang:
+            while True:
+                time.sleep(3600)
+        try:
+            with os.scandir(p) as it:
+                for de in it:
+                    count += 1
+                    if count % 1000 == 0:
+                        out.send({"h": 1})
+                    try:
+                        st = de.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        if st.st_dev != dev:
+                            continue
+                        stack.append(de.path)
+                    elif st.st_nlink > 1:
+                        if (st.st_dev, st.st_ino) in seen:
+                            continue
+                        seen.add((st.st_dev, st.st_ino))
+                    total += st.st_blocks * 512
+        except OSError:
+            unread += 1
+    return total, unread
+
+
 def walker_main(base):
     """The child. Reads jobs (one JSON line each) on stdin and writes one JSON line per
     folder. Plain files deep in the tree are summed per folder; the parent only needs
@@ -542,11 +598,16 @@ def walker_main(base):
         job = json.loads(line)
         lim, skip_slow, match = job.get("lim"), job.get("skip_slow", True), job.get("match")
         describe = {tuple(r) for r in job.get("describe", ())}
+        private = {tuple(r) for r in job.get("private", ())}
         for root in (tuple(r) for r in job["roots"]):
             stack = [root]
             while stack:
                 rel = stack.pop()
                 out.send({"o": rel})  # if open() blocks now, the parent knows where
+                if rel in private:  # one message with the total: no names, no folders
+                    total, unread = _private_total(os.path.join(base, *rel), dev, out, hang)
+                    out.send({"d": rel, "p": [total, unread]})
+                    continue
                 if rel and rel[-1] in hang:
                     while True:
                         time.sleep(3600)
@@ -638,9 +699,10 @@ class _Walker:
         self.lim, self.skip_slow = None, True
         sel.register(self.fd, selectors.EVENT_READ, self)
 
-    def start(self, roots, lim, skip_slow, describe, match):
+    def start(self, roots, lim, skip_slow, describe, match, private=()):
         job = {"roots": [list(r) for r in roots], "lim": lim, "skip_slow": skip_slow,
-               "describe": [list(r) for r in roots if r in describe], "match": match}
+               "describe": [list(r) for r in roots if r in describe], "match": match,
+               "private": [list(r) for r in private]}
         data = (json.dumps(job) + "\n").encode()
         while data:
             data = data[os.write(self.proc.stdin.fileno(), data):]
@@ -658,7 +720,7 @@ class _Walker:
 
 def walk(base, roots, on_listing, time_limit, stall_limit, describe=False, skip_slow=True,
          match=False, first_lim=None, workers=None, on_no_answer=None, on_skipped=None,
-         on_progress=None):
+         on_progress=None, private=()):
     """Walk folders under `base` in child processes; never touch the file system here.
 
     roots: {rel: ctx}. on_listing(rel, ctx, msg) returns {name: ctx} for subfolders.
@@ -707,11 +769,11 @@ def walk(base, roots, on_listing, time_limit, stall_limit, describe=False, skip_
             batch = [rel]
             while normal and len(batch) < UNITS_PER_JOB and normal[0][1] == lim:
                 batch.append(normal.popleft()[0])
-            w.start(batch, lim, skip_slow, describe, match)
+            w.start(batch, lim, skip_slow, describe, match, private)
         if guarded and not any(w.busy for w in walkers):  # last, one at a time
             nxt = min(guarded, key=lambda unit: (_guarded(unit[0]), unit[0]))
             guarded.remove(nxt)
-            idle_walker().start([nxt[0]], None, skip_slow, describe, match)
+            idle_walker().start([nxt[0]], None, skip_slow, describe, match, private)
 
     def skip(parent, why, test):
         dropped = []
@@ -814,12 +876,14 @@ def walk(base, roots, on_listing, time_limit, stall_limit, describe=False, skip_
     return cut, ctxs
 
 
-def scan_home(home, time_limit, stall_limit=None, progress=False, root=None):
+def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, private=None):
     """Walk the home folder once (in child processes), then, with `root`, the folders
     outside it. `time_limit` covers both. Returns the full result."""
     stall_limit = STALL_LIMIT if stall_limit is None else stall_limit
     started, t0 = _now(), time.monotonic()
     outside_budget = min(OUTSIDE_TIME_LIMIT, time_limit * 0.1) if root else 0
+    private = load_private(home) if private is None else private
+    private_rels = {tuple(p.split("/")) for p in private}
     items, unknown, not_measured, seen, no_answer = {}, {}, [], set(), []
     stats = {"folders": 0, "bytes": 0, "shown": t0}
 
@@ -853,11 +917,24 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None):
                 raise SystemExit(f"{NAME}: cannot read {home}")
             blocked(rel, owner, msg["err"])
             return {}
+        if "p" in msg:  # a private folder: its total, nothing else
+            total, unread = msg["p"]
+            owner.bytes += total
+            owner.partial = owner.partial or unread > 0
+            stats["bytes"] += total
+            return {}
         rows, names, subs = msg["e"], None, {}
         for name, kind, size, newest, link, markers in rows:
             crel = rel + (name,)
             if kind == 2:
                 not_measured.append({"rel": "/".join(crel), "reason": "other-disk"})
+                continue
+            if crel in private_rels:
+                item = items[crel] = Item(crel, PRIVATE)
+                (owner if owner is not None else anchor(crel[0])).private_children.append(item)
+                item.bytes += size
+                stats["bytes"] += size
+                subs[name] = item
                 continue
             child_owner = owner
             entry = match_path(crel)
@@ -912,7 +989,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None):
 
     timed_out, pending = walk(home, {(): None}, on_listing, time_limit - outside_budget,
                               stall_limit,
-                              match=True, first_lim=FIRST_DEPTH,
+                              match=True, first_lim=FIRST_DEPTH, private=private_rels,
                               on_no_answer=on_no_answer, on_skipped=on_skipped,
                               on_progress=on_progress if progress else None)
 
@@ -970,6 +1047,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None):
         "measured_bytes": measured,
         "outside": outside,
         "not_reached": not_reached,
+        "private": sorted(private),
         "kinds": {k: sum(r["bytes"] for r in records if r["kind"] == k) for k in KINDS},
         "not_measured": sorted(not_measured, key=lambda r: r["rel"]),
         "items": records,
@@ -1112,13 +1190,25 @@ def _record(it, home, now, nested=None):
         "names": [k for k, v in sorted(names.items(), key=lambda kv: -kv[1])[:3] if v > 0],
     }
     if rec["whole_folder_bytes"] >= BIG_UNKNOWN_BYTES:
-        top = sorted(it.grandchildren.items(), key=lambda kv: -kv[1])[:5]
-        rec["biggest_inside"] = [{"name": k, "bytes": v} for k, v in top if v > 0]
+        rec["biggest_inside"] = _inside_entries(it, it.grandchildren, 5)
     return rec
 
 
+def _inside_entries(it, counts, top):
+    """The biggest entries of a breakdown, with private folders as one entry each."""
+    rows = [{"name": k, "bytes": v} for k, v in counts.items() if v > 0]
+    rows += [{"name": "/".join(p.rel[len(it.rel):]), "bytes": p.bytes, "private": True}
+             for p in it.private_children]
+    return sorted(rows, key=lambda r: -r["bytes"])[:top]
+
+
 def _base_record(it, home, now):
-    top = sorted(it.children.items(), key=lambda kv: -kv[1])[:3]
+    if it.entry is PRIVATE:
+        return {"rel": "/".join(it.rel), "path": os.path.join(home, *it.rel), "id": "private",
+                "kind": "private", "bytes": it.bytes, "last_changed": None,
+                "last_changed_epoch": None, "days_unchanged": None,
+                "description": PRIVATE.description, "comes_back": RETURNS["no"],
+                "protected": True, "partial": it.partial, "biggest_inside": []}
     return {
         "rel": "/".join(it.rel),
         "path": os.path.join(home, *it.rel),
@@ -1132,7 +1222,7 @@ def _base_record(it, home, now):
         "comes_back": RETURNS[it.entry.returns],
         "protected": it.entry.protected,
         "partial": it.partial,
-        "biggest_inside": [{"name": k, "bytes": v} for k, v in top if v > 0],
+        "biggest_inside": _inside_entries(it, it.children, 3),
     }
 
 
@@ -1192,7 +1282,9 @@ def diff_scans(prev, cur):
     def hidden(rel):
         return any(rel == b or rel.startswith(b + "/") or b.startswith(rel + "/") for b in blocked)
 
-    before = {r["rel"]: r for r in prev.get("items", [])}
+    private = cur.get("private", [])
+    before = {r["rel"]: r for r in prev.get("items", [])
+              if not (_inside(r["rel"], private) and r["rel"] not in private)}
     after = {r["rel"]: r for r in cur["items"]}
     new, grown, shrunk = [], [], []
     for rel, r in after.items():
@@ -1290,9 +1382,12 @@ def render_scan(result, changes):
                 out.append(f"{pad}the whole folder is {fmt_bytes(r['whole_folder_bytes'])}; "
                            f"{fmt_bytes(elsewhere['bytes'])} of it is counted above "
                            f"({kinds}: {', '.join(elsewhere['names'])})")
-            if kind in ("user", "unknown") and r["biggest_inside"]:
+            shown = [c for c in r["biggest_inside"]  # "counted above" names private ones
+                     if not (elsewhere.get("bytes") and c.get("private"))]
+            if kind in ("user", "unknown") and shown:
                 inside = ", ".join(f"{c['name']} {fmt_bytes(c['bytes'])}"
-                                   for c in r["biggest_inside"])
+                                   + (" (private)" if c.get("private") else "")
+                                   for c in shown)
                 label = "the rest is mostly in" if elsewhere.get("bytes") else "biggest inside"
                 out.append(f"{pad}{label}: {inside}")
         if len(rows) > TEXT_TOP:
@@ -1433,6 +1528,7 @@ class PolicyError(Exception):
 def default_policy():
     kinds = {k: {"action": "ask"} for k in KINDS}
     kinds["user"] = {"action": "keep"}
+    kinds["private"] = {"action": "keep"}
     items = {e.id: {"action": "clean", "older_than_days": DEFAULT_CLEAN_DAYS}
              for e in CATALOG if e.auto_clean}
     return {"about": POLICY_ABOUT, "kinds": kinds, "items": items}
@@ -1528,7 +1624,7 @@ def cmd_policy(args, home):
         if target in KINDS:
             _check_rule(target, rule, target, False)
             policy.setdefault("kinds", {})[target] = rule
-        elif target in ENTRIES and target != "unknown":
+        elif target in ENTRIES and target not in ("unknown", "private"):
             entry = ENTRIES[target]
             _check_rule(target, rule, entry.kind, entry.protected)
             policy.setdefault("items", {})[target] = rule
@@ -1566,7 +1662,7 @@ def cmd_policy(args, home):
         print()
         print("Every catalog item (id, kind, where, what it is):")
         for e in ENTRIES.values():
-            if e is UNKNOWN:
+            if e is UNKNOWN or e is PRIVATE:
                 continue
             flag = "  [never removed by this tool]" if e.protected else ""
             print(f"  {e.id:<22} {e.kind:<6} ~/{e.pattern}  {e.description}"
@@ -1576,6 +1672,92 @@ def cmd_policy(args, home):
           "changed for N days, only when you run `clean --apply`.")
     if not args.all:
         print(f"All item ids: `{NAME} policy show --all`.")
+    return 0
+
+
+# ----------------------------------------------------------------------------- private
+
+PRIVATE_ABOUT = ("Private folders: the tool measures each one's total size and never lists, "
+                 "records or cleans anything inside it. Paths are under your home folder. "
+                 f"Change with `{NAME} private add|remove`.")
+
+
+def _private_rel(home, arg):
+    """A path the user typed -> "a/b" under home. ~/x, /abs/x and x (from home) work."""
+    if arg == "~" or arg.startswith("~/"):
+        path = os.path.join(home, arg[2:])
+    elif os.path.isabs(arg):
+        path = arg
+    else:
+        path = os.path.join(home, arg)
+    path = os.path.normpath(path)
+    rel = os.path.relpath(path, home)
+    if rel == "." or rel == ".." or rel.startswith(".." + os.sep) or os.path.isabs(rel):
+        raise PolicyError("a private folder must be inside your home folder, and not the "
+                          "home folder itself")
+    return rel.replace(os.sep, "/")
+
+
+def scrub_saved(home, folder):
+    """Remove what earlier scans recorded inside a folder that has just become private."""
+    state = state_dir(home)
+    for name in ("latest.json", "previous.json"):
+        path = os.path.join(state, name)
+        data = _read_json(path)
+        if not data:
+            continue
+        kept = []
+        for r in data.get("items", []):
+            if r["rel"].startswith(folder + "/"):
+                continue
+            if r["rel"] == folder or folder.startswith(r["rel"] + "/"):
+                base = r["rel"]
+                r["biggest_inside"] = [c for c in r.get("biggest_inside", [])
+                                       if not _inside(base + "/" + c["name"], [folder])
+                                       or base + "/" + c["name"] == folder]
+                if r["rel"] == folder:
+                    r["biggest_inside"] = []
+                if r.get("counted_elsewhere"):
+                    r["counted_elsewhere"]["names"] = []
+            kept.append(r)
+        data["items"] = kept
+        data["not_measured"] = [r for r in data.get("not_measured", [])
+                                if not r["rel"].startswith(folder + "/")]
+        data["not_reached"] = [r for r in data.get("not_reached", [])
+                               if not r["rel"].startswith(folder + "/")]
+        _write_json(path, data)
+    plan = os.path.join(state, "clean-plan.json")
+    if os.path.exists(plan):
+        os.unlink(plan)
+
+
+def cmd_private(args, home):
+    path = private_path(home)
+    folders = load_private(home)
+    if args.private_cmd == "list":
+        if not folders:
+            print(f"No private folders. Add one with `{NAME} private add <path>`.")
+        for f in folders:
+            print(disp(f))
+        return 0
+    rel = _private_rel(home, args.path)
+    if args.private_cmd == "add":
+        if rel in folders:
+            print(f"{disp(rel)} is already private.")
+            return 0
+        folders.append(rel)
+        _write_json(path, {"about": PRIVATE_ABOUT, "folders": sorted(folders)})
+        scrub_saved(home, rel)
+        note = "" if os.path.isdir(os.path.join(home, rel)) else " (it does not exist yet)"
+        print(f"{disp(rel)} is private{note}: scans show only its total size, and nothing "
+              "inside it is ever listed, saved or cleaned.")
+        return 0
+    if rel not in folders:
+        print(f"{disp(rel)} was not private.")
+        return 1
+    folders.remove(rel)
+    _write_json(path, {"about": PRIVATE_ABOUT, "folders": folders})
+    print(f"{disp(rel)} is no longer private; the next scan lists what is inside it.")
     return 0
 
 
@@ -1717,7 +1899,9 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
     """Rows of what `clean` would remove (remove=True) and what it leaves, with reasons."""
     now = _now()
     stall_limit = STALL_LIMIT if stall_limit is None else stall_limit
-    records = {r["rel"]: r for r in scan["items"]}
+    private = sorted(set(load_private(home)) | set(scan.get("private", [])))
+    records = {r["rel"]: r for r in scan["items"]
+               if not (_inside(r["rel"], private) and r["kind"] != "private")}
     rules = {}
 
     def rule(rec):
@@ -1729,6 +1913,10 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
     targets, recent = [], {"count": 0, "bytes": 0}
     if only:
         for rel in only:
+            folder = _inside(rel, private)
+            if folder:
+                raise PolicyError(f"{disp(folder)} is private: nothing inside it is ever "
+                                  "cleaned")
             if rel not in records:
                 raise PolicyError(f"{disp(rel)} is not an item from the last scan; "
                                   f"use a path as `scan` shows it")
@@ -1762,6 +1950,8 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
             reason = "never removed by this tool: " + entry.description
         elif r["action"] == "keep":
             reason = "your policy says keep"
+        elif any(f.startswith(rec["rel"] + "/") for f in private):
+            reason = "it holds a private folder"
         if reason is None:
             for other in records.values():
                 if other["rel"].startswith(rec["rel"] + "/"):
@@ -1988,6 +2178,11 @@ What it does
            when nothing in it changed for a number of days.
   clean    Lists exactly what your rules would remove and how much that frees.
            Nothing is removed until you run it again with --apply.
+  private  Folders whose contents must never be named, such as an employer's code or
+           client work: `{name} private add ~/Developer/Acme`. For each one the
+           report shows only its path and total size. Nothing inside it is listed,
+           saved, shown while scanning, or ever cleaned; adding one also removes what
+           earlier saved scans recorded inside it.
 
 What it never does
   - It never opens or reads your files: it looks at sizes and dates only.
@@ -2000,6 +2195,7 @@ What it never does
 
 Where it keeps its files
   Your rules:  {policy}
+  Private:     {private}
   Scans:       {state}
   The tool:    {tool}
 
@@ -2027,7 +2223,8 @@ system data your account may not read).
 
 
 def cmd_explain(args, home):
-    print(EXPLAIN.format(name=NAME, policy=policy_path(home), state=state_dir(home),
+    print(EXPLAIN.format(name=NAME, policy=policy_path(home), private=private_path(home),
+                         state=state_dir(home),
                          tool=tool_dir(), limit=_duration(DEFAULT_TIME_LIMIT),
                          stall=_duration(STALL_LIMIT),
                          sibling=_duration(SIBLING_STALL_LIMIT),
@@ -2076,6 +2273,16 @@ def main(argv=None):
     q.add_argument("--older-than-days", type=int, metavar="DAYS",
                    help=f"for clean: unused this many days (default {DEFAULT_CLEAN_DAYS})")
 
+    p = sub.add_parser("private", parents=[common],
+                       help="folders whose contents are never listed (size only)")
+    psub = p.add_subparsers(dest="private_cmd", metavar="add|remove|list")
+    psub.required = True
+    q = psub.add_parser("add", parents=[common], help="make a folder private")
+    q.add_argument("path", help="~/Developer/Acme, an absolute path, or a path under home")
+    q = psub.add_parser("remove", parents=[common], help="make a folder ordinary again")
+    q.add_argument("path")
+    psub.add_parser("list", parents=[common], help="show the private folders")
+
     p = sub.add_parser("clean", parents=[common],
                        help="list what the policy would remove; --apply removes it")
     p.add_argument("--apply", action="store_true", help="really remove the dry-run list")
@@ -2091,7 +2298,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     home = resolve_home(args.home)
     handler = {"scan": cmd_scan, "explain": cmd_explain, "policy": cmd_policy,
-               "clean": cmd_clean}[args.cmd]
+               "clean": cmd_clean, "private": cmd_private}[args.cmd]
     try:
         return handler(args, home)
     except PolicyError as exc:

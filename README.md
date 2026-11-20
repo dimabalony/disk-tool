@@ -37,8 +37,10 @@ now. Later, ask *"what's on my disk?"* and it leads with what changed since last
    that list does it remove them, moving them to the Trash where it can.
 
 Folders macOS keeps private (Mail, Messages, some app data) show as *not measured*, never as
-empty. To measure them, give your terminal app Full Disk Access in System Settings › Privacy
-& Security.
+empty. macOS may ask whether your terminal may open some of them; answer or ignore it. A
+folder macOS holds for more than 20 seconds is skipped, and a whole scan stops after 10
+minutes with what it has, so it never hangs. To measure those folders, give your terminal
+app Full Disk Access in System Settings › Privacy & Security.
 
 ## What it never does
 

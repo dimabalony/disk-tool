@@ -17,7 +17,9 @@ other cleaners. Everything goes through the tool.
    does, that macOS may ask for access to some folders, that the scan takes a few
    minutes). Otherwise skip the explanation.
 2. Run `disk-tool scan --json --time-limit 540` (give the shell call a 10-minute timeout).
-   Never pass `--home`: that is for tests.
+   Never pass `--home`: that is for tests. macOS may show the user a prompt asking whether
+   the terminal may open a folder; tell them before the scan that they can answer it or
+   ignore it. A folder macOS holds for more than 20 seconds is skipped, never waited on.
 3. Tell the user the result in plain words, short:
    - On a later run, lead with `changes`: free space then and now, what is new, what grew,
      what shrank.
@@ -27,8 +29,10 @@ other cleaners. Everything goes through the tool.
    - `unknown` items: name the biggest with what is inside (`biggest_inside`); the user
      decides about them. Do not guess what they are beyond what the path shows.
    - `not_measured`: one line, and the Full Disk Access hint once if the reason is
-     `privacy`. Never present these as empty.
-   - If `complete` is false, say the scan stopped early and sizes are lower bounds.
+     `privacy` or `no-answer` (macOS held the folder, usually behind a prompt). Never
+     present these as empty.
+   - If `complete` is false, say why in one line from `incomplete_reason`: the time limit
+     (sizes are lower bounds) or folders macOS did not answer for (they are not measured).
 
 ## Policy (once, then when the user wants a change)
 

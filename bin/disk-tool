@@ -1,0 +1,1332 @@
+#!/usr/bin/env python3
+"""See what fills your home folder, and clean what rebuilds itself.
+
+One file, Python 3.9+ standard library only, made for macOS.
+It looks at sizes and dates only: it never opens your files and never uses the network.
+Run `explain` for the plain-words version.
+"""
+
+import argparse
+import datetime
+import errno
+import fnmatch
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from collections import namedtuple
+
+NAME = "disk-tool"  # the product name lives here and only here
+VERSION = "0.1.0"
+ENV_HOME = NAME.upper().replace("-", "_") + "_HOME"  # measure another folder instead of ~
+
+DEFAULT_TIME_LIMIT = 600  # seconds a scan may run before it reports what it has
+DEFAULT_CLEAN_DAYS = 30
+MB = 1000 * 1000
+LIST_MIN_BYTES = 1 * MB  # smaller items are left out of the lists
+CHANGE_MIN_BYTES = 100 * MB  # smaller changes between two scans are not reported
+JSON_TOP = 15  # items per kind in `scan --json`
+TEXT_TOP = 5  # items per kind in the text report
+NOT_MEASURED_TOP = 30
+PLAN_MAX_AGE = 24 * 3600  # `clean --apply` needs a dry run younger than this
+
+_now = time.time  # tests replace it to make things look old
+
+
+# ----------------------------------------------------------------------------- catalog
+
+# The kinds, in report order.
+KINDS = {
+    "cache": "Cache: rebuilds by itself",
+    "temp": "Temporary files and leftovers",
+    "dev": "Developer files and tools",
+    "apps": "App data and settings",
+    "user": "Your files",
+    "unknown": "Not in the catalog: you judge these",
+}
+NEVER_CLEAN = ("user", "unknown")
+
+RETURNS = {
+    "auto": "comes back by itself",
+    "command": "a command brings it back",
+    "no": "does not come back",
+}
+
+Entry = namedtuple("Entry", "id kind pattern returns description auto_clean protected")
+
+
+def E(id, kind, pattern, returns, description, auto_clean=False, protected=False):
+    return Entry(id, kind, pattern, returns, description, auto_clean, protected)
+
+
+# One row per thing the tool recognises.
+#   pattern     a path inside the home folder; `*` matches one name. The first part is
+#               a plain name. When several rows match a path, the most specific wins;
+#               a row deeper in the tree takes its bytes away from the row above it.
+#   returns     auto | command | no: whether it comes back after removal (see RETURNS).
+#   auto_clean  `policy init` proposes `clean` after 30 days unused. Caches only.
+#   protected   never removed by this tool; the description says what to do instead.
+CATALOG = [
+    # cache
+    E("library-caches", "cache", "Library/Caches/*", "auto",
+      "An app's cache. The app rebuilds it when it needs it.", auto_clean=True),
+    E("homebrew-cache", "cache", "Library/Caches/Homebrew", "auto",
+      "Homebrew downloads. Homebrew downloads again what it needs.", auto_clean=True),
+    E("pip-cache", "cache", "Library/Caches/pip", "auto",
+      "pip download cache. pip downloads again what it needs.", auto_clean=True),
+    E("yarn-cache", "cache", "Library/Caches/Yarn", "auto",
+      "Yarn package cache. Yarn downloads again what it needs.", auto_clean=True),
+    E("cocoapods-cache", "cache", "Library/Caches/CocoaPods", "auto",
+      "CocoaPods download cache.", auto_clean=True),
+    E("go-build-cache", "cache", "Library/Caches/go-build", "auto",
+      "Go build cache. The next build fills it again.", auto_clean=True),
+    E("swiftpm-cache", "cache", "Library/Caches/org.swift.swiftpm", "auto",
+      "Swift Package Manager download cache.", auto_clean=True),
+    E("jetbrains-cache", "cache", "Library/Caches/JetBrains", "auto",
+      "JetBrains IDE caches and indexes. The IDE rebuilds them (the first start is slower).",
+      auto_clean=True),
+    E("chrome-cache", "cache", "Library/Caches/Google", "auto",
+      "Google Chrome's cache.", auto_clean=True),
+    E("safari-cache", "cache", "Library/Caches/com.apple.Safari", "auto",
+      "Safari's cache.", auto_clean=True),
+    E("firefox-cache", "cache", "Library/Caches/Firefox", "auto",
+      "Firefox's cache.", auto_clean=True),
+    E("brave-cache", "cache", "Library/Caches/BraveSoftware", "auto",
+      "Brave's cache.", auto_clean=True),
+    E("edge-cache", "cache", "Library/Caches/Microsoft Edge", "auto",
+      "Microsoft Edge's cache.", auto_clean=True),
+    E("app-container-cache", "cache", "Library/Containers/*/Data/Library/Caches", "auto",
+      "Cache of a sandboxed app. The app rebuilds it.", auto_clean=True),
+    E("xcode-derived-data", "cache", "Library/Developer/Xcode/DerivedData", "auto",
+      "Xcode build files. Xcode rebuilds them on the next build.", auto_clean=True),
+    E("simulator-caches", "cache", "Library/Developer/CoreSimulator/Caches", "auto",
+      "Simulator caches. The simulator rebuilds them.", auto_clean=True),
+    E("npm-cache", "cache", ".npm/_cacache", "auto",
+      "npm download cache. npm downloads again what it needs.", auto_clean=True),
+    E("pnpm-store", "cache", "Library/pnpm/store", "auto",
+      "pnpm package store. `pnpm install` fills it again.", auto_clean=True),
+    E("pnpm-store-xdg", "cache", ".local/share/pnpm/store", "auto",
+      "pnpm package store. `pnpm install` fills it again.", auto_clean=True),
+    E("pnpm-store-old", "cache", ".pnpm-store", "auto",
+      "pnpm package store (older location). `pnpm install` fills it again.", auto_clean=True),
+    E("yarn-berry-cache", "cache", ".yarn/berry/cache", "auto",
+      "Yarn package cache.", auto_clean=True),
+    E("bun-cache", "cache", ".bun/install/cache", "auto",
+      "Bun package cache.", auto_clean=True),
+    E("uv-cache", "cache", ".cache/uv", "auto",
+      "uv (Python) package cache. uv downloads again what it needs.", auto_clean=True),
+    E("xdg-cache", "cache", ".cache/*", "auto",
+      "Cache of a command-line tool. Most tools rebuild it; some keep downloads here."),
+    E("gradle-cache", "cache", ".gradle/caches", "auto",
+      "Gradle dependency and build cache. The next build downloads again what it needs.",
+      auto_clean=True),
+    E("gradle-wrapper", "cache", ".gradle/wrapper/dists", "auto",
+      "Gradle versions downloaded by projects. Downloaded again when a project needs one.",
+      auto_clean=True),
+    E("maven-repo", "cache", ".m2/repository", "auto",
+      "Maven dependency cache. The next build downloads again what it needs.", auto_clean=True),
+    E("cargo-registry", "cache", ".cargo/registry", "auto",
+      "Rust crate downloads. Cargo downloads again what it needs.", auto_clean=True),
+    E("cargo-git", "cache", ".cargo/git", "auto",
+      "Rust dependencies fetched from git. Cargo fetches them again.", auto_clean=True),
+    E("go-mod-cache", "cache", "go/pkg/mod", "auto",
+      "Go module downloads. Go downloads again what it needs.", auto_clean=True),
+    E("cocoapods-repos", "cache", ".cocoapods/repos", "auto",
+      "CocoaPods spec repositories. `pod install` fetches them again.", auto_clean=True),
+    # temp
+    E("trash", "temp", ".Trash/*", "no",
+      "In the Trash. Gone for good once removed."),
+    E("logs", "temp", "Library/Logs/*", "auto",
+      "Log files. Apps write new ones; the old lines are gone."),
+    E("device-support", "temp", "Library/Developer/Xcode/*OS DeviceSupport/*", "auto",
+      "Debug files for one iOS (or watchOS, tvOS) version. Xcode copies them again when "
+      "you connect a device on that version."),
+    E("simulator-device", "temp", "Library/Developer/CoreSimulator/Devices/*", "no",
+      "One simulator device with its apps and data. Xcode can make a new one; "
+      "the data inside is lost."),
+    E("xcode-previews", "temp", "Library/Developer/Xcode/UserData/Previews", "auto",
+      "SwiftUI preview simulators. Xcode makes them again."),
+    # dev
+    E("xcode-archives", "dev", "Library/Developer/Xcode/Archives", "no",
+      "Release builds you archived in Xcode. Needed to read old crash reports; not rebuilt."),
+    E("android-sdk", "dev", "Library/Android/sdk", "command",
+      "Android SDK. Android Studio downloads it again."),
+    E("android-avd", "dev", ".android/avd", "no",
+      "Android emulator devices and their data."),
+    E("nvm-versions", "dev", ".nvm/versions", "command",
+      "Node.js versions installed with nvm. `nvm install` brings one back."),
+    E("pyenv-versions", "dev", ".pyenv/versions", "command",
+      "Python versions installed with pyenv. `pyenv install` brings one back."),
+    E("rustup-toolchains", "dev", ".rustup/toolchains", "command",
+      "Rust toolchains. `rustup toolchain install` brings one back."),
+    E("huggingface", "dev", ".cache/huggingface", "command",
+      "AI models and datasets from Hugging Face. They download again when used, "
+      "which can take long."),
+    E("lm-studio", "dev", ".cache/lm-studio", "command",
+      "LM Studio models. Download them again in LM Studio."),
+    E("lm-studio-home", "dev", ".lmstudio", "command",
+      "LM Studio models. Download them again in LM Studio."),
+    E("ollama", "dev", ".ollama", "command",
+      "Ollama models. `ollama pull` downloads them again."),
+    E("docker-desktop", "dev", "Library/Containers/com.docker.docker", "no",
+      "Docker Desktop's disk image: your images, containers and volumes. Free space with "
+      "`docker system prune` or Docker Desktop's settings, never by removing this.",
+      protected=True),
+    E("colima", "dev", ".colima", "no",
+      "Colima virtual machine disk: your Docker images and containers. Free space with "
+      "`docker system prune`.", protected=True),
+    E("lima", "dev", ".lima", "no",
+      "Lima virtual machine disks. Remove machines with `limactl delete`.", protected=True),
+    E("orbstack", "dev", ".orbstack", "no",
+      "OrbStack data. Free space with OrbStack's own clean-up.", protected=True),
+    E("orbstack-data", "dev", "Library/Group Containers/*.dev.orbstack", "no",
+      "OrbStack's disk image: your containers and machines. Free space with OrbStack's own "
+      "clean-up.", protected=True),
+    # apps
+    E("library-other", "apps", "Library/*", "no",
+      "App data and settings."),
+    E("app-support", "apps", "Library/Application Support/*", "no",
+      "An app's data and settings."),
+    E("app-container", "apps", "Library/Containers/*", "no",
+      "A sandboxed app's data and settings."),
+    E("app-group-container", "apps", "Library/Group Containers/*", "no",
+      "Data shared by a group of apps from one maker."),
+    E("user-apps", "apps", "Applications", "command",
+      "Apps installed for your user only."),
+    # user: reported, never proposed for removal
+    E("documents", "user", "Documents", "no", "Your Documents folder."),
+    E("desktop", "user", "Desktop", "no", "Your Desktop."),
+    E("downloads", "user", "Downloads", "no", "Your Downloads folder."),
+    E("pictures", "user", "Pictures", "no", "Your Pictures folder, with the Photos library."),
+    E("movies", "user", "Movies", "no", "Your Movies folder."),
+    E("music", "user", "Music", "no", "Your Music folder."),
+    E("icloud-drive", "user", "Library/Mobile Documents", "no",
+      "iCloud Drive files kept on this Mac."),
+    E("cloud-storage", "user", "Library/CloudStorage/*", "no",
+      "Files from a cloud drive (Dropbox, Google Drive, OneDrive) kept on this Mac."),
+    E("device-backups", "user", "Library/Application Support/MobileSync/Backup", "no",
+      "iPhone and iPad backups made by Finder. Remove old ones in Finder, under the device."),
+]
+
+Project = namedtuple("Project", "entry names next_to contains")
+
+
+def P(id, names, next_to, contains, description):
+    entry = E(id, "dev", "**/" + names[0], "command", description)
+    return Project(entry, tuple(names), tuple(next_to), tuple(contains))
+
+
+# Build output and dependencies inside project folders. Looked for anywhere in the home
+# folder except ~/Library, ~/Applications, hidden top-level folders (~/.something) and app
+# bundles. A folder only counts when its marker is there: a file next to it (next_to) or
+# inside it (contains).
+PROJECT_FOLDERS = [
+    P("node-modules", ["node_modules"], ["package.json"], [],
+      "JavaScript packages of one project. `npm install` (or pnpm, yarn) brings them back."),
+    P("python-venv", [".venv", "venv"], [], ["pyvenv.cfg"],
+      "Python environment of one project. Make it again and reinstall its packages."),
+    P("rust-target", ["target"], ["Cargo.toml"], [],
+      "Rust build output. `cargo build` makes it again."),
+    P("swift-build", [".build"], ["Package.swift"], [],
+      "Swift package build output. `swift build` makes it again."),
+    P("gradle-build", ["build"], ["build.gradle", "build.gradle.kts"], [],
+      "Gradle build output. The next build makes it again."),
+    P("gradle-project-cache", [".gradle"],
+      ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"], [],
+      "Gradle's cache for one project. The next build makes it again."),
+    P("cocoapods-pods", ["Pods"], ["Podfile"], [],
+      "CocoaPods dependencies of one project. `pod install` brings them back."),
+    P("next-build", [".next"], ["package.json"], [],
+      "Next.js build output. The next build makes it again."),
+    P("dart-tool", [".dart_tool"], ["pubspec.yaml"], [],
+      "Dart or Flutter build files. `flutter pub get` brings them back."),
+    P("tox-envs", [".tox"], ["tox.ini", "pyproject.toml", "setup.cfg"], [],
+      "Python test environments made by tox. tox makes them again."),
+]
+
+UNKNOWN = E("unknown", "unknown", "*", "no",
+            "Not in the catalog. Look at it and decide yourself.")
+
+ENTRIES = {e.id: e for e in CATALOG + [p.entry for p in PROJECT_FOLDERS] + [UNKNOWN]}
+
+_BY_KEY = {}
+for _e in CATALOG:
+    _parts = tuple(_e.pattern.split("/"))
+    _BY_KEY.setdefault((_parts[0], len(_parts)), []).append((_parts, _e))
+_MAX_DEPTH = max(len(e.pattern.split("/")) for e in CATALOG)
+_PROJECT_BY_NAME = {}
+for _p in PROJECT_FOLDERS:
+    for _n in _p.names:
+        _PROJECT_BY_NAME.setdefault(_n, []).append(_p)
+
+
+def _specificity(parts):
+    literal = sum(1 for p in parts if not any(c in p for c in "*?["))
+    return (literal, sum(len(p.replace("*", "")) for p in parts))
+
+
+def match_path(rel):
+    """The catalog entry for a path (a tuple of names under home), or None."""
+    if len(rel) > _MAX_DEPTH:
+        return None
+    best = None
+    for parts, entry in _BY_KEY.get((rel[0], len(rel)), ()):
+        if all(fnmatch.fnmatchcase(n, p) for n, p in zip(rel[1:], parts[1:])):
+            score = _specificity(parts)
+            if best is None or score > best[0]:
+                best = (score, entry)
+    return best[1] if best else None
+
+
+def _project_allowed(rel, owner):
+    if owner is not None and owner.entry.kind != "user":
+        return False
+    if rel[0] in ("Library", "Applications") or rel[0].startswith("."):
+        return False
+    return not any(part.endswith(".app") for part in rel[:-1])
+
+
+def match_project(rel, sibling_names, path):
+    for project in _PROJECT_BY_NAME.get(rel[-1], ()):
+        if any(m in sibling_names for m in project.next_to):
+            return project.entry
+        if any(os.path.lexists(os.path.join(path, m)) for m in project.contains):
+            return project.entry
+    return None
+
+
+# ----------------------------------------------------------------------------- places
+
+def resolve_home(arg):
+    home = arg or os.environ.get(ENV_HOME) or os.path.expanduser("~")
+    home = os.path.realpath(os.path.expanduser(home))
+    if not os.path.isdir(home):
+        raise SystemExit(f"{NAME}: {home} is not a folder")
+    return home
+
+
+def _xdg(var, home, *default):
+    value = os.environ.get(var, "")
+    return value if os.path.isabs(value) else os.path.join(home, *default)
+
+
+def policy_path(home):
+    return os.path.join(_xdg("XDG_CONFIG_HOME", home, ".config"), NAME, "policy.json")
+
+
+def state_dir(home):
+    return os.path.join(_xdg("XDG_STATE_HOME", home, ".local", "state"), NAME)
+
+
+def tool_dir():
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def latest_scan(home):
+    return _read_json(os.path.join(state_dir(home), "latest.json"))
+
+
+# ----------------------------------------------------------------------------- display
+
+def fmt_bytes(n, sign=False):
+    value = float(abs(n))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1000 or unit == "TB":
+            break
+        value /= 1000
+    text = f"{value:.0f} {unit}" if unit in ("B", "KB") else f"{value:.1f} {unit}"
+    if n < 0:
+        return "-" + text
+    return ("+" + text) if sign else text
+
+
+def iso(t):
+    return datetime.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
+
+
+def when(t):
+    return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+
+
+def disp(rel):
+    return "~/" + rel if rel else "~"
+
+
+def days_since(t, now=None):
+    return max(0, int(((now if now is not None else _now()) - t) // 86400))
+
+
+# ----------------------------------------------------------------------------- scan
+
+class Item:
+    __slots__ = ("rel", "entry", "bytes", "newest", "partial", "unreadable", "children")
+
+    def __init__(self, rel, entry):
+        self.rel, self.entry = rel, entry
+        self.bytes, self.newest = 0, 0.0
+        self.partial = self.unreadable = False
+        self.children = {}
+
+    def add(self, rel, size, changed):
+        self.bytes += size
+        if changed > self.newest:
+            self.newest = changed
+        depth = len(self.rel)
+        if len(rel) > depth:
+            key = rel[depth]
+            self.children[key] = self.children.get(key, 0) + size
+
+
+def _refusal(exc):
+    if exc.errno == errno.EPERM:
+        return "privacy"
+    if exc.errno == errno.EACCES:
+        return "permission"
+    return "error"
+
+
+NOT_MEASURED_TEXT = {
+    "privacy": "macOS privacy protection",
+    "permission": "no permission to read it",
+    "other-disk": "another disk or volume, not counted",
+    "error": "could not be read",
+}
+
+
+def scan_home(home, time_limit):
+    """Walk the home folder once. Returns the full result (all items)."""
+    started, t0 = _now(), time.monotonic()
+    deadline = t0 + time_limit
+    home_st = os.lstat(home)
+    dev = home_st.st_dev
+    items = {}
+    unknown = {}
+    not_measured = []
+    seen = set()
+    stack = [(home, (), None)]
+    count = 0
+    stopped = False
+
+    def anchor(name):
+        if name not in unknown:
+            unknown[name] = Item((name,), UNKNOWN)
+        return unknown[name]
+
+    while stack:
+        if time.monotonic() > deadline:
+            stopped = True
+            break
+        path, rel, owner = stack.pop()
+        try:
+            with os.scandir(path) as it:
+                entries = list(it)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            if not rel:
+                raise SystemExit(f"{NAME}: cannot read {home}: {exc.strerror}")
+            target = owner if owner is not None else anchor(rel[0])
+            if target.rel == rel:
+                target.unreadable = True
+            else:
+                target.partial = True
+            row = {"rel": "/".join(rel), "reason": _refusal(exc)}
+            if target.rel == rel and target.entry is not UNKNOWN:
+                row["id"] = target.entry.id
+                row["description"] = target.entry.description
+            not_measured.append(row)
+            continue
+        names = None
+        for de in entries:
+            count += 1
+            if count % 500 == 0 and time.monotonic() > deadline:
+                break  # the outer loop sees the deadline and stops
+            try:
+                st = de.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            crel = rel + (de.name,)
+            is_dir = stat.S_ISDIR(st.st_mode)
+            if is_dir and st.st_dev != dev:
+                not_measured.append({"rel": "/".join(crel), "reason": "other-disk"})
+                continue
+            child_owner = owner
+            entry = match_path(crel)
+            if entry is None and is_dir and _project_allowed(crel, owner):
+                if names is None:
+                    names = {x.name for x in entries}
+                entry = match_project(crel, names, de.path)
+            if entry is not None:
+                child_owner = Item(crel, entry)
+                items[crel] = child_owner
+            size = st.st_blocks * 512
+            if not is_dir and st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    size = 0
+                else:
+                    seen.add(key)
+            target = child_owner if child_owner is not None else anchor(crel[0])
+            target.add(crel, size, max(st.st_mtime, st.st_ctime))
+            if is_dir:
+                stack.append((de.path, crel, child_owner))
+
+    all_items = list(items.values()) + list(unknown.values())
+    records = [_record(it, home, started) for it in all_items if not it.unreadable]
+    records.sort(key=lambda r: -r["bytes"])
+    usage = shutil.disk_usage(home)
+    result = {
+        "tool": NAME,
+        "version": VERSION,
+        "home": home,
+        "scanned_at": iso(started),
+        "scanned_at_epoch": started,
+        "seconds": round(time.monotonic() - t0, 1),
+        "complete": not stopped,
+        "incomplete_reason": (
+            f"stopped after the time limit ({time_limit:g} s); sizes are at least what is shown"
+            if stopped else None),
+        "disk": {"total": usage.total, "used": usage.used, "free": usage.free},
+        "measured_bytes": sum(r["bytes"] for r in records),
+        "kinds": {k: sum(r["bytes"] for r in records if r["kind"] == k) for k in KINDS},
+        "not_measured": sorted(not_measured, key=lambda r: r["rel"]),
+        "items": records,
+    }
+    return result
+
+
+def _record(it, home, now):
+    top = sorted(it.children.items(), key=lambda kv: -kv[1])[:3]
+    return {
+        "rel": "/".join(it.rel),
+        "path": os.path.join(home, *it.rel),
+        "id": it.entry.id,
+        "kind": it.entry.kind,
+        "bytes": it.bytes,
+        "last_changed": iso(it.newest) if it.newest else None,
+        "last_changed_epoch": it.newest,
+        "days_unchanged": days_since(it.newest, now) if it.newest else None,
+        "description": it.entry.description,
+        "comes_back": RETURNS[it.entry.returns],
+        "protected": it.entry.protected,
+        "partial": it.partial,
+        "biggest_inside": [{"name": k, "bytes": v} for k, v in top if v > 0],
+    }
+
+
+def diff_scans(prev, cur):
+    if prev is None:
+        return {"since": None, "available": False, "reason": "first scan"}
+    out = {"since": prev.get("scanned_at"), "since_epoch": prev.get("scanned_at_epoch")}
+    if not prev.get("complete") or not cur.get("complete"):
+        out.update(available=False,
+                   reason="one of the two scans stopped early, so changes are not compared")
+        return out
+    blocked = [r["rel"] for r in cur.get("not_measured", [])]
+
+    def hidden(rel):
+        return any(rel == b or rel.startswith(b + "/") or b.startswith(rel + "/") for b in blocked)
+
+    before = {r["rel"]: r for r in prev.get("items", [])}
+    after = {r["rel"]: r for r in cur["items"]}
+    new, grown, shrunk = [], [], []
+    for rel, r in after.items():
+        old = before.get(rel)
+        row = {"rel": rel, "kind": r["kind"], "description": r["description"],
+               "bytes": r["bytes"], "before": old["bytes"] if old else 0}
+        row["change"] = row["bytes"] - row["before"]
+        if old is None:
+            if r["bytes"] >= CHANGE_MIN_BYTES:
+                new.append(row)
+        elif row["change"] >= CHANGE_MIN_BYTES:
+            grown.append(row)
+        elif -row["change"] >= CHANGE_MIN_BYTES:
+            shrunk.append(row)
+    for rel, r in before.items():
+        if rel not in after and r["bytes"] >= CHANGE_MIN_BYTES and not hidden(rel):
+            shrunk.append({"rel": rel, "kind": r["kind"], "description": r["description"],
+                           "bytes": 0, "before": r["bytes"], "change": -r["bytes"]})
+    out.update(
+        available=True,
+        free_before=prev["disk"]["free"], free_now=cur["disk"]["free"],
+        free_change=cur["disk"]["free"] - prev["disk"]["free"],
+        kinds={k: cur["kinds"][k] - prev.get("kinds", {}).get(k, 0) for k in KINDS},
+        new=sorted(new, key=lambda r: -r["change"]),
+        grown=sorted(grown, key=lambda r: -r["change"]),
+        shrunk=sorted(shrunk, key=lambda r: r["change"]),
+    )
+    return out
+
+
+def save_scan(home, result):
+    folder = state_dir(home)
+    latest = os.path.join(folder, "latest.json")
+    if os.path.exists(latest):
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        os.replace(latest, os.path.join(folder, "previous.json"))
+    _write_json(latest, result)
+
+
+def scan_view(result, changes, top):
+    """What `scan --json` prints: totals and the biggest items per kind."""
+    kinds = {}
+    for kind, label in KINDS.items():
+        rows = [r for r in result["items"] if r["kind"] == kind]
+        kinds[kind] = {
+            "label": label,
+            "bytes": result["kinds"][kind],
+            "items": [_public(r) for r in rows if r["bytes"] >= LIST_MIN_BYTES][:top],
+            "items_total": len(rows),
+        }
+    blocked = result["not_measured"]
+    view = {k: v for k, v in result.items() if k not in ("items", "kinds", "not_measured")}
+    view["kinds"] = kinds
+    view["not_measured"] = blocked[:NOT_MEASURED_TOP]
+    view["not_measured_total"] = len(blocked)
+    if any(r["reason"] == "privacy" for r in blocked):
+        view["not_measured_hint"] = FDA_HINT
+    trimmed = dict(changes)
+    for key in ("new", "grown", "shrunk"):
+        if key in trimmed:
+            trimmed[key] = trimmed[key][:top]
+    view["changes"] = trimmed
+    view["first_scan"] = changes.get("reason") == "first scan"
+    return view
+
+
+def _public(r):
+    return {k: v for k, v in r.items() if not k.endswith("_epoch")}
+
+
+FDA_HINT = ("To measure these, give your terminal app Full Disk Access: System Settings > "
+            "Privacy & Security > Full Disk Access. Or leave them out; nothing else changes.")
+
+
+def render_scan(result, changes):
+    out = []
+    head = f"Scanned {result['home']} in {_duration(result['seconds'])}."
+    if not result["complete"]:
+        head += " INCOMPLETE: " + result["incomplete_reason"] + "."
+    out.append(head)
+    d = result["disk"]
+    out.append(f"Disk: {fmt_bytes(d['free'])} free of {fmt_bytes(d['total'])}.")
+    out.append(f"Measured in the home folder: {fmt_bytes(result['measured_bytes'])}.")
+    for kind, label in KINDS.items():
+        rows = [r for r in result["items"]
+                if r["kind"] == kind and r["bytes"] >= LIST_MIN_BYTES]
+        out.append("")
+        out.append(f"{label}: {fmt_bytes(result['kinds'][kind])}")
+        for r in rows[:TEXT_TOP]:
+            size = ("at least " if r["partial"] else "") + fmt_bytes(r["bytes"])
+            out.append(f"  {size:>10}  {disp(r['rel'])}  {r['description']}")
+            if kind in ("user", "unknown") and r["biggest_inside"]:
+                inside = ", ".join(f"{c['name']} {fmt_bytes(c['bytes'])}"
+                                   for c in r["biggest_inside"])
+                out.append(f"  {'':>10}  biggest inside: {inside}")
+        if len(rows) > TEXT_TOP:
+            out.append(f"  ... and {len(rows) - TEXT_TOP} more")
+    blocked = result["not_measured"]
+    if blocked:
+        out.append("")
+        out.append("Not measured (never counted as empty):")
+        for r in blocked[:8]:
+            out.append(f"  {disp(r['rel'])}: {NOT_MEASURED_TEXT[r['reason']]}")
+        if len(blocked) > 8:
+            out.append(f"  ... and {len(blocked) - 8} more")
+        if any(r["reason"] == "privacy" for r in blocked):
+            out.append("  " + FDA_HINT)
+    out.append("")
+    out.extend(render_changes(changes))
+    return "\n".join(out)
+
+
+def render_changes(ch):
+    if ch.get("since") is None:
+        return ["First scan: the next one will show what changed."]
+    lines = [f"Since the last scan ({when(ch['since_epoch'])}):"]
+    if not ch.get("available"):
+        return lines + ["  " + ch["reason"] + "."]
+    lines.append(f"  Free space: {fmt_bytes(ch['free_before'])} -> {fmt_bytes(ch['free_now'])}"
+                 f" ({fmt_bytes(ch['free_change'], sign=True)})")
+    for key, label in (("new", "new"), ("grown", "grew"), ("shrunk", "shrank")):
+        for r in ch[key][:TEXT_TOP]:
+            lines.append(f"  {label:<6} {fmt_bytes(r['change'], sign=True):>10}  {disp(r['rel'])}"
+                         f"  ({r['kind']}, now {fmt_bytes(r['bytes'])})")
+    if not (ch["new"] or ch["grown"] or ch["shrunk"]):
+        lines.append(f"  Nothing changed by more than {fmt_bytes(CHANGE_MIN_BYTES)}.")
+    return lines
+
+
+def _duration(seconds):
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    return f"{seconds // 60} min" + (f" {seconds % 60} s" if seconds % 60 else "")
+
+
+def cmd_scan(args, home):
+    if sys.stderr.isatty() and not args.json:
+        print(f"Scanning {home} (up to {_duration(args.time_limit)}; sizes only)...",
+              file=sys.stderr)
+    prev = latest_scan(home)
+    result = scan_home(home, args.time_limit)
+    changes = diff_scans(prev, result)
+    save_scan(home, result)
+    if args.json:
+        print(json.dumps(scan_view(result, changes, JSON_TOP), indent=2, ensure_ascii=False))
+    else:
+        print(render_scan(result, changes))
+    return 0
+
+
+# ----------------------------------------------------------------------------- policy
+
+ACTIONS = ("keep", "ask", "clean")
+POLICY_ABOUT = (
+    "Cleaning rules. keep = never touch. ask = list it so you decide. clean = remove when "
+    "nothing in it changed for older_than_days (only when you run clean --apply). "
+    "'items' (catalog ids) override 'kinds'. 'user' and 'unknown' can never be clean.")
+
+
+class PolicyError(Exception):
+    pass
+
+
+def default_policy():
+    kinds = {k: {"action": "ask"} for k in KINDS}
+    kinds["user"] = {"action": "keep"}
+    items = {e.id: {"action": "clean", "older_than_days": DEFAULT_CLEAN_DAYS}
+             for e in CATALOG if e.auto_clean}
+    return {"about": POLICY_ABOUT, "kinds": kinds, "items": items}
+
+
+def _check_rule(name, rule, kind, protected):
+    if not isinstance(rule, dict) or rule.get("action") not in ACTIONS:
+        raise PolicyError(f"'{name}' needs an action: one of {', '.join(ACTIONS)}")
+    if rule["action"] == "clean":
+        if kind in NEVER_CLEAN:
+            raise PolicyError(f"'{name}' is '{kind}', which can never be clean")
+        if protected:
+            raise PolicyError(f"'{name}' is never removed by this tool: {ENTRIES[name].description}")
+        days = rule.get("older_than_days")
+        if not isinstance(days, int) or isinstance(days, bool) or days < 0:
+            raise PolicyError(f"'{name}' is clean, so it needs older_than_days (0 or more)")
+
+
+def validate_policy(data):
+    if not isinstance(data, dict):
+        raise PolicyError("the file must hold a JSON object")
+    kinds = data.get("kinds", {})
+    items = data.get("items", {})
+    if not isinstance(kinds, dict) or not isinstance(items, dict):
+        raise PolicyError("'kinds' and 'items' must be objects")
+    for kind, rule in kinds.items():
+        if kind not in KINDS:
+            raise PolicyError(f"unknown kind '{kind}'; kinds are {', '.join(KINDS)}")
+        _check_rule(kind, rule, kind, False)
+    warnings = []
+    for item_id, rule in items.items():
+        entry = ENTRIES.get(item_id)
+        if entry is None:
+            warnings.append(f"policy: '{item_id}' is not in the catalog any more; ignored")
+            continue
+        _check_rule(item_id, rule, entry.kind, entry.protected)
+    return warnings
+
+
+def load_policy(home, required=True):
+    path = policy_path(home)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        if required:
+            raise PolicyError(f"no policy yet; `{NAME} policy init` writes the defaults")
+        return None
+    except ValueError as exc:
+        raise PolicyError(f"{path} is not valid JSON: {exc}")
+    for warning in validate_policy(data):
+        print(warning, file=sys.stderr)
+    return data
+
+
+def rule_for(policy, entry):
+    """The rule that applies to a catalog entry: its own, else its kind's, else ask."""
+    rule = policy.get("items", {}).get(entry.id) or policy.get("kinds", {}).get(entry.kind)
+    rule = dict(rule or {"action": "ask"})
+    if entry.kind in NEVER_CLEAN or entry.protected:
+        if rule["action"] == "clean":  # belt and braces: validate_policy already refuses it
+            rule = {"action": "ask"}
+    return rule
+
+
+def _rule_text(rule):
+    if rule["action"] == "clean":
+        return f"clean when unused {rule['older_than_days']} days"
+    return rule["action"]
+
+
+def cmd_policy(args, home):
+    path = policy_path(home)
+    if args.policy_cmd == "init":
+        if os.path.exists(path) and not args.force:
+            print(f"{path} already exists; nothing changed. Use --force to replace it "
+                  "with the defaults.")
+            return 1
+        _write_json(path, default_policy())
+        print(f"Wrote the default policy to {path}.")
+        print("Caches that rebuild themselves: clean when unused 30 days. "
+              "Your files: keep. Everything else: ask.")
+        return 0
+    if args.policy_cmd == "set":
+        target, action = args.target, args.action
+        policy = load_policy(home, required=False)
+        created = policy is None
+        policy = policy or default_policy()
+        rule = {"action": action}
+        if action == "clean":
+            rule["older_than_days"] = (args.older_than_days if args.older_than_days is not None
+                                       else DEFAULT_CLEAN_DAYS)
+        if target in KINDS:
+            _check_rule(target, rule, target, False)
+            policy.setdefault("kinds", {})[target] = rule
+        elif target in ENTRIES and target != "unknown":
+            entry = ENTRIES[target]
+            _check_rule(target, rule, entry.kind, entry.protected)
+            policy.setdefault("items", {})[target] = rule
+        else:
+            raise PolicyError(f"'{target}' is not a kind or a catalog id; "
+                              f"see `{NAME} policy show --all`")
+        validate_policy(policy)
+        _write_json(path, policy)
+        note = " (the file did not exist, so it starts from the defaults)" if created else ""
+        print(f"{target}: {_rule_text(rule)}. Saved to {path}{note}.")
+        return 0
+    # show
+    policy = load_policy(home, required=False)
+    saved = policy is not None
+    policy = policy or default_policy()
+    if args.json:
+        print(json.dumps({"path": path, "saved": saved, "policy": policy,
+                          "catalog": [e._asdict() for e in ENTRIES.values()] if args.all else None},
+                         indent=2, ensure_ascii=False))
+        return 0
+    print(f"Policy file: {path}" + ("" if saved else
+          f"  (not saved yet: these are the defaults; `{NAME} policy init` writes them)"))
+    print()
+    print("By kind:")
+    for kind in KINDS:
+        rule = policy.get("kinds", {}).get(kind, {"action": "ask"})
+        print(f"  {kind:<8} {_rule_text(rule):<28} {KINDS[kind]}")
+    print()
+    print("By item (these override the kind):")
+    for item_id, rule in policy.get("items", {}).items():
+        entry = ENTRIES.get(item_id)
+        where = entry.pattern if entry else "(not in the catalog)"
+        print(f"  {item_id:<22} {_rule_text(rule):<28} ~/{where}")
+    if args.all:
+        print()
+        print("Every catalog item (id, kind, where, what it is):")
+        for e in ENTRIES.values():
+            if e is UNKNOWN:
+                continue
+            flag = "  [never removed by this tool]" if e.protected else ""
+            print(f"  {e.id:<22} {e.kind:<6} ~/{e.pattern}  {e.description}"
+                  f" ({RETURNS[e.returns]}){flag}")
+    print()
+    print("keep = never touch. ask = list it so you decide. clean = remove when nothing in it "
+          "changed for N days, only when you run `clean --apply`.")
+    if not args.all:
+        print(f"All item ids: `{NAME} policy show --all`.")
+    return 0
+
+
+# ----------------------------------------------------------------------------- clean
+
+def measure(path, deadline):
+    """Size, newest change and git folders of one item, without following links."""
+    res = {"bytes": 0, "newest": 0.0, "unreadable": False, "mount": False,
+           "timeout": False, "missing": False, "git": []}
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        res["missing"] = True
+        return res
+    res["bytes"] = st.st_blocks * 512
+    res["newest"] = max(st.st_mtime, st.st_ctime)
+    if not stat.S_ISDIR(st.st_mode):
+        return res
+    dev, seen, stack, count = st.st_dev, set(), [path], 0
+    while stack:
+        p = stack.pop()
+        try:
+            with os.scandir(p) as it:
+                entries = list(it)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            res["unreadable"] = True
+            continue
+        for de in entries:
+            count += 1
+            if count % 500 == 0 and time.monotonic() > deadline:
+                res["timeout"] = True
+                return res
+            if de.name == ".git":
+                res["git"].append(p)
+            try:
+                st = de.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            is_dir = stat.S_ISDIR(st.st_mode)
+            if is_dir and st.st_dev != dev:
+                res["mount"] = True
+                continue
+            size = st.st_blocks * 512
+            if not is_dir and st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                size = 0 if key in seen else size
+                seen.add(key)
+            res["bytes"] += size
+            res["newest"] = max(res["newest"], st.st_mtime, st.st_ctime)
+            if is_dir:
+                stack.append(de.path)
+    return res
+
+
+def check_path(home, path):
+    """Why this path must not be removed, or None. Re-checked right before removal."""
+    home = os.path.realpath(home)
+    rel = os.path.relpath(path, home)
+    if os.path.isabs(rel) or rel == "." or rel.startswith(".." + os.sep) or rel == "..":
+        return "outside your home folder"
+    if len(rel.split(os.sep)) < 2:
+        return "a top-level folder of your home; never removed"
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "already gone"
+    if stat.S_ISLNK(st.st_mode):
+        target = os.path.realpath(path)
+        if not target.startswith(home + os.sep):
+            return "a link pointing outside your home folder"
+        return "a link, not the folder itself"
+    if os.path.realpath(path) != os.path.join(home, rel):
+        return "reached through a link"
+    return None
+
+
+def _git(repo, *argv):
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    try:
+        proc = subprocess.run(["git", "-C", repo] + list(argv), capture_output=True,
+                              text=True, env=env, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def git_check(home, path, git_dirs):
+    """Refuse git projects with unsaved work inside the item, and files git tracks."""
+    for repo in git_dirs:
+        name = disp(os.path.relpath(repo, home))
+        status = _git(repo, "status", "--porcelain")
+        if status is None:
+            return f"git project {name} could not be checked"
+        if status.strip():
+            return f"git project {name} has uncommitted changes"
+        unpushed = _git(repo, "log", "--branches", "--not", "--remotes", "--oneline", "-n", "1")
+        if unpushed is None or unpushed.strip():
+            return f"git project {name} has commits that are not pushed"
+        stashes = _git(repo, "stash", "list")
+        if stashes is None or stashes.strip():
+            return f"git project {name} has stashed changes"
+    parent = os.path.dirname(path)
+    while True:
+        if os.path.lexists(os.path.join(parent, ".git")):
+            tracked = _git(parent, "ls-files", "-z", "--", os.path.relpath(path, parent))
+            if tracked is None:
+                return "inside a git project that could not be checked"
+            if tracked:
+                return "git tracks files in it"
+            break
+        if parent == home or os.path.dirname(parent) == parent:
+            break
+        parent = os.path.dirname(parent)
+    return None
+
+
+def build_plan(home, scan, policy, only, time_limit):
+    """Rows of what `clean` would remove (remove=True) and what it leaves, with reasons."""
+    now = _now()
+    deadline = time.monotonic() + time_limit
+    records = {r["rel"]: r for r in scan["items"]}
+    rules = {}
+
+    def rule(rec):
+        if rec["rel"] not in rules:
+            entry = ENTRIES.get(rec["id"], UNKNOWN)
+            rules[rec["rel"]] = (entry, rule_for(policy, entry))
+        return rules[rec["rel"]]
+
+    targets, recent = [], {"count": 0, "bytes": 0}
+    if only:
+        for rel in only:
+            if rel not in records:
+                raise PolicyError(f"{disp(rel)} is not an item from the last scan; "
+                                  f"use a path as `scan` shows it")
+            targets.append(records[rel])
+    else:
+        for rec in records.values():
+            entry, r = rule(rec)
+            if r["action"] != "clean":
+                continue
+            if days_since(rec["last_changed_epoch"] or now, now) < r["older_than_days"]:
+                recent["count"] += 1
+                recent["bytes"] += rec["bytes"]
+                continue
+            targets.append(rec)
+    targets.sort(key=lambda r: -r["bytes"])
+    rows = []
+    for rec in targets:
+        entry, r = rule(rec)
+        path = os.path.join(home, *rec["rel"].split("/"))
+        row = {"rel": rec["rel"], "path": path, "id": entry.id, "kind": entry.kind,
+               "bytes": rec["bytes"], "description": entry.description,
+               "comes_back": RETURNS[entry.returns], "rule": _rule_text(r),
+               "days_unchanged": None, "remove": False, "reason": None}
+        rows.append(row)
+        reason = None
+        if entry.kind == "user":
+            reason = "your own files; never removed"
+        elif entry.kind == "unknown":
+            reason = "not in the catalog; never removed by this tool"
+        elif entry.protected:
+            reason = "never removed by this tool: " + entry.description
+        elif r["action"] == "keep":
+            reason = "your policy says keep"
+        if reason is None:
+            for other in records.values():
+                if other["rel"].startswith(rec["rel"] + "/"):
+                    o_entry, o_rule = rule(other)
+                    if o_entry.kind in NEVER_CLEAN or o_entry.protected or (
+                            o_rule["action"] != "clean" and not only) or o_rule["action"] == "keep":
+                        reason = (f"it holds {disp(other['rel'])} ({o_entry.kind}), "
+                                  f"which your policy does not clean")
+                        break
+        if reason is None:
+            reason = check_path(home, path)
+        if reason is None:
+            m = measure(path, deadline)
+            row["bytes"] = m["bytes"]
+            row["days_unchanged"] = days_since(m["newest"], now)
+            if m["missing"]:
+                reason = "already gone"
+            elif m["timeout"]:
+                reason = "ran out of time checking it"
+            elif m["unreadable"]:
+                reason = "could not look inside all of it"
+            elif m["mount"]:
+                reason = "another disk is mounted inside it"
+            elif not only and row["days_unchanged"] < r["older_than_days"]:
+                reason = f"changed {row['days_unchanged']} days ago"
+            else:
+                reason = git_check(home, path, m["git"])
+        row["reason"] = reason
+        row["remove"] = reason is None
+    return rows, recent
+
+
+def _plan_file(home):
+    return os.path.join(state_dir(home), "clean-plan.json")
+
+
+def _trash_dest(trash, name):
+    dest = os.path.join(trash, name)
+    if not os.path.lexists(dest):
+        return dest
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H.%M.%S")
+    n = 0
+    while True:
+        dest = os.path.join(trash, f"{name} {stamp}" + (f" {n}" if n else ""))
+        if not os.path.lexists(dest):
+            return dest
+        n += 1
+
+
+def _delete(path):
+    def retry(func, p, _exc):
+        try:
+            os.chmod(os.path.dirname(p), 0o700)
+            os.chmod(p, 0o700)
+        except OSError:
+            pass
+        func(p)
+
+    if os.path.isdir(path) and not os.path.islink(path):
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=retry)
+        else:
+            shutil.rmtree(path, onerror=retry)
+    else:
+        os.unlink(path)
+
+
+def remove_item(home, path, rel):
+    """Move to the Trash when possible, otherwise delete. Returns what happened."""
+    reason = check_path(home, path)
+    if reason:
+        return None, reason
+    if rel.split("/")[0] != ".Trash":
+        trash = os.path.join(home, ".Trash")
+        try:
+            os.makedirs(trash, mode=0o700, exist_ok=True)
+            os.rename(path, _trash_dest(trash, os.path.basename(path)))
+            return "moved to the Trash", None
+        except OSError:
+            pass
+    try:
+        _delete(path)
+    except OSError as exc:
+        return None, f"could not remove it: {exc.strerror or exc}"
+    return "deleted", None
+
+
+def cmd_clean(args, home):
+    scan = latest_scan(home)
+    if scan is None:
+        print(f"No scan yet. Run `{NAME} scan` first.")
+        return 1
+    policy = load_policy(home, required=not args.path) or default_policy()
+    only = [p[2:] if p.startswith("~/") else os.path.relpath(p, home) if os.path.isabs(p)
+            else p for p in (args.path or [])]
+    only = [p.rstrip("/") for p in only]
+    rows, recent = build_plan(home, scan, policy, only, args.time_limit)
+    plan_file = _plan_file(home)
+    if not args.apply:
+        _write_json(plan_file, {"home": home, "created_epoch": _now(),
+                                "remove": [r["rel"] for r in rows if r["remove"]]})
+        return _report_plan(args, scan, rows, recent)
+    saved = _read_json(plan_file)
+    if (not saved or saved.get("home") != home
+            or _now() - saved.get("created_epoch", 0) > PLAN_MAX_AGE):
+        print(f"Run `{NAME} clean` without --apply first, check its list, then apply "
+              "within a day.")
+        return 1
+    shown = set(saved.get("remove", []))
+    free_before = shutil.disk_usage(home).free
+    done, skipped = [], []
+    for row in rows:
+        if not row["remove"]:
+            continue
+        if row["rel"] not in shown:
+            row["reason"] = "was not in the dry run you checked"
+            skipped.append(row)
+            continue
+        how, reason = remove_item(home, row["path"], row["rel"])
+        if how:
+            row["done"] = how
+            done.append(row)
+        else:
+            row["reason"] = reason
+            skipped.append(row)
+    os.unlink(plan_file)
+    free_after = shutil.disk_usage(home).free
+    in_trash = sum(r["bytes"] for r in done if r["done"] == "moved to the Trash")
+    if args.json:
+        print(json.dumps({"applied": True, "removed": done, "skipped": skipped,
+                          "free_before": free_before, "free_after": free_after,
+                          "moved_to_trash_bytes": in_trash}, indent=2, ensure_ascii=False))
+        return 0
+    if done:
+        print(f"Removed {len(done)} item{'s' if len(done) != 1 else ''}:")
+        for r in done:
+            print(f"  {r['done']:<19} {fmt_bytes(r['bytes']):>9}  {disp(r['rel'])}")
+    else:
+        print("Removed nothing.")
+    if skipped:
+        print("Skipped:")
+        for r in skipped:
+            print(f"  {disp(r['rel'])}: {r['reason']}")
+    print(f"Free space: {fmt_bytes(free_before)} -> {fmt_bytes(free_after)} "
+          f"({fmt_bytes(free_after - free_before, sign=True)}).")
+    if in_trash:
+        print(f"{fmt_bytes(in_trash)} is now in the Trash. Empty the Trash to get that space back.")
+    return 0
+
+
+def _report_plan(args, scan, rows, recent):
+    keep = [r for r in rows if r["remove"]]
+    left = [r for r in rows if not r["remove"]]
+    total = sum(r["bytes"] for r in keep)
+    if args.json:
+        print(json.dumps({"applied": False, "scan_from": scan["scanned_at"],
+                          "remove": keep, "remove_bytes": total, "left_alone": left,
+                          "used_recently": recent}, indent=2, ensure_ascii=False))
+        return 0
+    print("Dry run: nothing is removed.")
+    print(f"Based on the scan from {when(scan['scanned_at_epoch'])}.")
+    print()
+    if keep:
+        print(f"Would remove {len(keep)} item{'s' if len(keep) != 1 else ''}, "
+              f"{fmt_bytes(total)} in total:")
+        for r in keep:
+            print(f"  {fmt_bytes(r['bytes']):>9}  {disp(r['rel'])}  "
+                  f"(unchanged {r['days_unchanged']} days; {r['comes_back']})")
+    else:
+        print("Nothing to remove.")
+    if left:
+        print()
+        print("Left alone:")
+        for r in left:
+            print(f"  {disp(r['rel'])}: {r['reason']}")
+    if recent["count"]:
+        print()
+        print(f"{recent['count']} more item{'s' if recent['count'] != 1 else ''} "
+              f"({fmt_bytes(recent['bytes'])}) have a clean rule but changed recently; "
+              "they stay.")
+    if keep:
+        extra = "".join(f" --path '{r['rel']}'" for r in keep) if args.path else ""
+        print()
+        print(f"To remove exactly the {len(keep)} above: {NAME} clean{extra} --apply")
+        print("Items go to the Trash (items already in the Trash are deleted).")
+    return 0
+
+
+# ----------------------------------------------------------------------------- explain
+
+EXPLAIN = """\
+How {name} works
+
+What it does
+  scan     Adds up how much space each folder in your home folder takes, and sorts it
+           into six kinds:
+             cache    rebuilds by itself: app caches, Xcode build files, npm, pip and
+                      Homebrew downloads, browser caches
+             temp     leftovers: the Trash, logs, old simulators, old iPhone debug files
+             dev      project files a command brings back (node_modules, .venv, build
+                      folders), developer tools, and Docker and other virtual disks
+             apps     app data and settings in ~/Library
+             user     your own files: Documents, Desktop, Downloads, Pictures, Movies, Music
+             unknown  anything else that is big: you judge these
+           It keeps the result, so the next scan can say what is new or has grown.
+  policy   One small file with your rules, per kind or per item: keep, ask, or clean
+           when nothing in it changed for a number of days.
+  clean    Lists exactly what your rules would remove and how much that frees.
+           Nothing is removed until you run it again with --apply.
+
+What it never does
+  - It never opens or reads your files: it looks at sizes and dates only.
+  - It never uses the network and sends nothing anywhere.
+  - It never removes your own files (user) or anything it does not recognise (unknown).
+  - It never removes anything outside your home folder, never follows links out of it,
+    and never touches a git project with uncommitted or unpushed work.
+  - It never runs by itself: there is no background job unless you set one up.
+
+Where it keeps its files
+  Your rules:  {policy}
+  Scans:       {state}
+  The tool:    {tool}
+
+How cleaning works
+  1. `{name} clean` shows the list and the space it frees.
+  2. `{name} clean --apply` removes only that list, checking each item again first and
+     skipping anything that changed. Items go to the Trash when possible: empty the
+     Trash to get the space back. Items already in the Trash are deleted.
+
+Privacy prompts
+  macOS may ask whether your terminal may access Documents, Desktop or other apps' data.
+  Folders macOS keeps closed are shown as "not measured", never as empty. To measure
+  them, give your terminal app Full Disk Access (System Settings > Privacy & Security).
+
+A scan takes a few minutes and stops after {limit} at most.
+"""
+
+
+def cmd_explain(args, home):
+    print(EXPLAIN.format(name=NAME, policy=policy_path(home), state=state_dir(home),
+                         tool=tool_dir(), limit=_duration(DEFAULT_TIME_LIMIT)))
+    last = latest_scan(home)
+    if last is None:
+        print("Last scan: never")
+    else:
+        state = "complete" if last.get("complete") else "incomplete"
+        print(f"Last scan: {when(last['scanned_at_epoch'])} ({state})")
+    return 0
+
+
+# ----------------------------------------------------------------------------- main
+
+def main(argv=None):
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--home", help=f"folder to treat as home (default: ~ or ${ENV_HOME})")
+    parser = argparse.ArgumentParser(
+        prog=NAME, description="See what fills your home folder, and clean what rebuilds itself.")
+    parser.add_argument("--version", action="version", version=f"{NAME} {VERSION}")
+    sub = parser.add_subparsers(dest="cmd", metavar="command")
+    sub.required = True
+
+    p = sub.add_parser("scan", parents=[common], help="measure the home folder")
+    p.add_argument("--json", action="store_true", help="print JSON (for agents)")
+    p.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT, metavar="SECONDS",
+                   help=f"stop and report after this long (default {DEFAULT_TIME_LIMIT})")
+
+    sub.add_parser("explain", parents=[common], help="how the tool works, in plain words")
+
+    p = sub.add_parser("policy", parents=[common], help="show or change the cleaning rules")
+    psub = p.add_subparsers(dest="policy_cmd", metavar="show|init|set")
+    psub.required = True
+    q = psub.add_parser("show", parents=[common], help="print the rules")
+    q.add_argument("--all", action="store_true", help="also list every catalog item")
+    q.add_argument("--json", action="store_true")
+    q = psub.add_parser("init", parents=[common], help="write the safe defaults")
+    q.add_argument("--force", action="store_true", help="replace an existing policy")
+    q = psub.add_parser("set", parents=[common], help="set one rule")
+    q.add_argument("target", help="a kind (cache, temp, dev, apps, user, unknown) or an item id")
+    q.add_argument("action", choices=ACTIONS)
+    q.add_argument("--older-than-days", type=int, metavar="DAYS",
+                   help=f"for clean: unused this many days (default {DEFAULT_CLEAN_DAYS})")
+
+    p = sub.add_parser("clean", parents=[common],
+                       help="list what the policy would remove; --apply removes it")
+    p.add_argument("--apply", action="store_true", help="really remove the dry-run list")
+    p.add_argument("--path", action="append", metavar="PATH",
+                   help="only this item from the last scan (repeatable), whatever its rule "
+                        "except keep")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT, metavar="SECONDS")
+
+    args = parser.parse_args(argv)
+    home = resolve_home(args.home)
+    handler = {"scan": cmd_scan, "explain": cmd_explain, "policy": cmd_policy,
+               "clean": cmd_clean}[args.cmd]
+    try:
+        return handler(args, home)
+    except PolicyError as exc:
+        print(f"{NAME}: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

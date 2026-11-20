@@ -23,16 +23,22 @@ other cleaners. Everything goes through the tool.
 3. Tell the user the result in plain words, short:
    - On a later run, lead with `changes`: free space then and now, what is new, what grew,
      what shrank.
-   - Free space, then the biggest things, each with its kind in words: cache (comes back by
-     itself), temporary, developer files, app data, your files, not in the catalog.
+   - Free space, and where the used space is (`disk`): how much is in the home folder and
+     how much is outside it (apps, macOS data, other accounts, not scanned) or not
+     measured. Free space is approximate: Finder also counts purgeable space as free.
+   - The biggest things, each with its kind in words: cache (comes back by itself),
+     temporary, developer files, app data, your files, not in the catalog.
    - Say which space is cache and which is not.
-   - `unknown` items: name the biggest with what is inside (`biggest_inside`); the user
-     decides about them. Do not guess what they are beyond what the path shows.
+   - `unknown` items: name the biggest with what is inside (`biggest_inside`, two levels
+     deep for big folders) and how much of the folder is already counted under other
+     kinds (`counted_elsewhere`, such as node_modules); the user decides about the rest.
+     Do not guess what they are beyond what the path shows.
    - `not_measured`: one line, and the Full Disk Access hint once if the reason is
      `privacy` or `no-answer` (macOS held the folder, usually behind a prompt). Never
      present these as empty.
    - If `complete` is false, say why in one line from `incomplete_reason`: the time limit
-     (sizes are lower bounds) or folders macOS did not answer for (they are not measured).
+     (name the areas in `not_reached`; sizes there are lower bounds) or folders macOS did
+     not answer for (they are not measured).
 
 ## Policy (once, then when the user wants a change)
 

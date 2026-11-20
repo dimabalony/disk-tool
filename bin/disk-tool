@@ -12,6 +12,7 @@ import errno
 import fnmatch
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -938,9 +939,14 @@ def check_path(home, path):
 
 
 def _git(repo, *argv):
+    # The repo may sit inside a downloaded cache, so switch off what its own config
+    # could make git run, and any network transport.
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    hardening = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                 "-c", "core.untrackedCache=false", "-c", "protocol.allow=never"]
     try:
-        proc = subprocess.run(["git", "-C", repo] + list(argv), capture_output=True,
+        proc = subprocess.run(["git"] + hardening + ["-C", repo] + list(argv),
+                              capture_output=True,
                               text=True, env=env, timeout=60, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1077,11 +1083,14 @@ def _trash_dest(trash, name):
 
 def _delete(path):
     def retry(func, p, _exc):
-        try:
-            os.chmod(os.path.dirname(p), 0o700)
-            os.chmod(p, 0o700)
-        except OSError:
-            pass
+        # A read-only folder (Go's module cache) blocks removal: make it writable and
+        # try once more. Never chmod through a link.
+        for target in (os.path.dirname(p), p):
+            try:
+                if not os.path.islink(target):
+                    os.chmod(target, 0o700)
+            except OSError:
+                pass
         func(p)
 
     if os.path.isdir(path) and not os.path.islink(path):
@@ -1207,7 +1216,7 @@ def _report_plan(args, scan, rows, recent):
               f"({fmt_bytes(recent['bytes'])}) have a clean rule but changed recently; "
               "they stay.")
     if keep:
-        extra = "".join(f" --path '{r['rel']}'" for r in keep) if args.path else ""
+        extra = "".join(" --path " + shlex.quote(r["rel"]) for r in keep) if args.path else ""
         print()
         print(f"To remove exactly the {len(keep)} above: {NAME} clean{extra} --apply")
         print("Items go to the Trash (items already in the Trash are deleted).")

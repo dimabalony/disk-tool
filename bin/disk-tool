@@ -12,6 +12,7 @@ import errno
 import fnmatch
 import json
 import os
+import plistlib
 import shlex
 import shutil
 import stat
@@ -26,11 +27,13 @@ NAME = "disk-tool"  # the product name lives here and only here
 VERSION = "0.1.0"
 ENV_HOME = NAME.upper().replace("-", "_") + "_HOME"  # measure another folder instead of ~
 
+MB = 1000 * 1000
 DEFAULT_TIME_LIMIT = 600  # seconds a scan may run before it reports what it has
 STALL_LIMIT = 20  # seconds one folder may keep macOS silent before it is skipped
+SIBLING_STALL_LIMIT = 5  # the same, for folders next to one that already stalled
+BIG_UNKNOWN_BYTES = 5 * 1000 * MB  # unknown folders this big get a two-level breakdown
 PROGRESS_EVERY = 3  # seconds between progress lines on stderr
 DEFAULT_CLEAN_DAYS = 30
-MB = 1000 * 1000
 LIST_MIN_BYTES = 1 * MB  # smaller items are left out of the lists
 CHANGE_MIN_BYTES = 100 * MB  # smaller changes between two scans are not reported
 JSON_TOP = 15  # items per kind in `scan --json`
@@ -387,13 +390,15 @@ def days_since(t, now=None):
 # ----------------------------------------------------------------------------- scan
 
 class Item:
-    __slots__ = ("rel", "entry", "bytes", "newest", "partial", "unreadable", "children")
+    __slots__ = ("rel", "entry", "bytes", "newest", "partial", "unreadable", "children",
+                 "grandchildren")
 
     def __init__(self, rel, entry):
         self.rel, self.entry = rel, entry
         self.bytes, self.newest = 0, 0.0
         self.partial = self.unreadable = False
         self.children = {}
+        self.grandchildren = {} if entry is UNKNOWN else None
 
     def add(self, rel, size, changed):
         self.bytes += size
@@ -403,6 +408,9 @@ class Item:
         if len(rel) > depth:
             key = rel[depth]
             self.children[key] = self.children.get(key, 0) + size
+            if self.grandchildren is not None:
+                key = "/".join(rel[depth:depth + 2])
+                self.grandchildren[key] = self.grandchildren.get(key, 0) + size
 
 
 def _refusal(exc):
@@ -434,6 +442,20 @@ ENV_TEST_HANG = NAME.upper().replace("-", "_") + "_TEST_HANG"  # tests: block on
 _CONTAINS = {name: tuple(m for p in projects for m in p.contains)
              for name, projects in _PROJECT_BY_NAME.items()}
 
+# Walked after everything else, so a time limit cuts these rather than the rest:
+# 1 = folders macOS usually guards with a privacy prompt, 2 = cloud drives (slow, large).
+SLOW_AREAS = {
+    ("Library", "Containers"): 1, ("Library", "Group Containers"): 1,
+    ("Library", "Mail"): 1, ("Library", "Messages"): 1, ("Library", "Safari"): 1,
+    ("Library", "Mobile Documents"): 2, ("Library", "CloudStorage"): 2,
+}
+
+
+def _slow_rank(rel):
+    if rel in SLOW_AREAS:
+        return SLOW_AREAS[rel]
+    return 1 if rel and rel[-1].endswith(".photoslibrary") else 0
+
 
 def walker_main(home):
     """The child. Reads its job on stdin and writes one JSON line per folder."""
@@ -450,12 +472,26 @@ def walker_main(home):
         if flush:
             out.flush()
 
-    stack = list(reversed(roots))
-    while stack:
-        rel = stack.pop()
+    stack, later = [], []
+
+    def push(rels):
+        for rel in reversed(rels):
+            rank = _slow_rank(rel)
+            if rank:
+                later.append((rank, len(later), rel))
+            else:
+                stack.append(rel)
+
+    push(roots)
+    while stack or later:
+        if stack:
+            rel = stack.pop()
+        else:
+            later.sort(key=lambda x: (-x[0], -x[1]))
+            rel = later.pop()[2]
         path = os.path.join(home, *rel)
         send({"o": rel}, flush=True)  # if open() blocks now, the parent knows where
-        if hang and rel and rel[-1] == hang:
+        if hang and rel and rel[-1] in hang.split(","):
             while True:
                 time.sleep(3600)
         msg = {"d": rel}
@@ -502,7 +538,7 @@ def walker_main(home):
                 subdirs.append(rel + (de.name,))
         msg["e"] = rows
         send(msg)
-        stack.extend(reversed(subdirs))
+        push(subdirs)
     send({"end": True}, flush=True)
     return 0
 
@@ -524,16 +560,25 @@ def walk(home, roots, on_listing, time_limit, stall_limit, describe_roots=False,
     """Walk folders in child processes, never touching the file system here.
 
     roots: {rel: ctx}. on_listing(rel, ctx, msg) returns {name: ctx} for subfolders.
-    on_no_answer(rel, ctx, why) is called for a folder the child got stuck on (why:
-    "no-answer") or died on ("error"); the walk goes on without it.
-    Returns True when the time limit cut the walk short.
+    on_no_answer(rel, ctx, why, waited) is called for a folder the child got stuck on
+    (why: "no-answer") or died on ("error"); the walk goes on without it. Once a folder
+    stalls, its siblings get SIBLING_STALL_LIMIT, so a row of guarded folders stays cheap.
+    Returns (cut, pending): cut is True when the time limit (or a stuck child outside any
+    folder) ended the walk early; pending maps the folders not walked to their ctx.
     """
     deadline = time.monotonic() + time_limit
     pending = dict(roots)
+    stalled_parents = set()
+
+    def limit_for(rel):
+        if rel is not None and rel[:-1] in stalled_parents:
+            return min(stall_limit, SIBLING_STALL_LIMIT)
+        return stall_limit
+
     script = os.path.realpath(__file__)
     while pending:
         if time.monotonic() >= deadline:
-            return True
+            return True, pending
         proc = subprocess.Popen([sys.executable, "-I", script, "_walk", home],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
         current, finished, stalled = None, False, False
@@ -551,13 +596,14 @@ def walk(home, roots, on_listing, time_limit, stall_limit, describe_roots=False,
                 while not finished:
                     now = time.monotonic()
                     if now >= deadline:
-                        return True
-                    if now - last >= stall_limit:
+                        return True, pending
+                    limit = limit_for(current)
+                    if now - last >= limit:
                         stalled = True
                         break
                     if on_progress:
                         on_progress(current)
-                    if not sel.select(min(deadline - now, last + stall_limit - now, 1.0)):
+                    if not sel.select(min(deadline - now, last + limit - now, 1.0)):
                         continue
                     chunk = os.read(fd, 1 << 16)
                     if not chunk:
@@ -582,11 +628,14 @@ def walk(home, roots, on_listing, time_limit, stall_limit, describe_roots=False,
         if finished:
             break
         if current is None or current not in pending:
-            return True  # stuck outside any folder: give up rather than loop
+            return True, pending  # stuck outside any folder: give up rather than loop
         ctx = pending.pop(current)
+        waited = limit_for(current)
+        if stalled:
+            stalled_parents.add(current[:-1])
         if on_no_answer:
-            on_no_answer(current, ctx, "no-answer" if stalled else "error")
-    return False
+            on_no_answer(current, ctx, "no-answer" if stalled else "error", waited)
+    return False, pending
 
 
 def scan_home(home, time_limit, stall_limit=None, progress=False):
@@ -650,27 +699,45 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
                 subs[name] = child_owner
         return subs
 
-    def on_no_answer(rel, owner, why):
+    def on_no_answer(rel, owner, why, waited):
         blocked(rel, owner, why)
         no_answer.append(rel)
         if progress:
-            text = (f"macOS did not answer in {_duration(stall_limit)} (privacy prompt?)"
+            text = (f"macOS did not answer in {_duration(waited)} (privacy prompt?)"
                     if why == "no-answer" else "could not be read")
-            print(f"  {disp('/'.join(rel))}: {text}; skipping it", file=sys.stderr, flush=True)
+            print(f"  {_short(rel)}: {text}; skipping it", file=sys.stderr, flush=True)
 
     def on_progress(current):
         now = time.monotonic()
         if now - stats["shown"] >= PROGRESS_EVERY:
             stats["shown"] = now
-            where = disp("/".join(current)) if current else "..."
+            where = _short(current) if current is not None else "..."
             print(f"  scanning {where}  ({stats['folders']} folders, "
                   f"{fmt_bytes(stats['bytes'])} so far)", file=sys.stderr, flush=True)
 
-    timed_out = walk(home, {(): None}, on_listing, time_limit, stall_limit,
-                     on_no_answer=on_no_answer, on_progress=on_progress if progress else None)
+    timed_out, pending = walk(home, {(): None}, on_listing, time_limit, stall_limit,
+                              on_no_answer=on_no_answer,
+                              on_progress=on_progress if progress else None)
 
+    # What the time limit left out: the items concerned are only partly measured.
+    areas = {}
+    for rel, owner in pending.items():
+        if not rel:
+            areas[()] = "not started"
+            continue
+        (owner if owner is not None else anchor(rel[0])).partial = True
+        area = rel[:2] if rel[0] == "Library" and len(rel) >= 2 else rel[:1]
+        if rel == area or areas.get(area) != "not started":
+            areas[area] = "not started" if rel == area else "partly"
+    not_reached = [{"rel": "/".join(a), "status": st} for a, st in sorted(areas.items())]
+
+    nested = {}  # unknown top-level folder -> items of other kinds inside it
+    for it in items.values():
+        if it.rel[0] in unknown and len(it.rel) > 1:
+            nested.setdefault(it.rel[0], []).append(it)
     all_items = list(items.values()) + list(unknown.values())
-    records = [_record(it, home, started) for it in all_items if not it.unreadable]
+    records = [_record(it, home, started, nested.get(it.rel[0]) if it.entry is UNKNOWN else None)
+               for it in all_items if not it.unreadable]
     records.sort(key=lambda r: -r["bytes"])
     reasons = []
     if timed_out:
@@ -680,7 +747,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
         reasons.append(f"macOS did not answer for {len(no_answer)} folder"
                        f"{'s' if len(no_answer) != 1 else ''} (privacy prompt?); "
                        "listed as not measured")
-    usage = shutil.disk_usage(home)
+    measured = sum(r["bytes"] for r in records)
     return {
         "tool": NAME,
         "version": VERSION,
@@ -691,15 +758,38 @@ def scan_home(home, time_limit, stall_limit=None, progress=False):
         "complete": not reasons,
         "timed_out": timed_out,
         "incomplete_reason": "; ".join(reasons) or None,
-        "disk": {"total": usage.total, "used": usage.used, "free": usage.free},
-        "measured_bytes": sum(r["bytes"] for r in records),
+        "disk": disk_numbers(home, measured, len(not_measured)),
+        "measured_bytes": measured,
+        "not_reached": not_reached,
         "kinds": {k: sum(r["bytes"] for r in records if r["kind"] == k) for k in KINDS},
         "not_measured": sorted(not_measured, key=lambda r: r["rel"]),
         "items": records,
     }
 
 
-def _record(it, home, now):
+def _record(it, home, now, nested=None):
+    rec = _base_record(it, home, now)
+    if it.entry is not UNKNOWN:
+        return rec
+    nested = nested or []
+    by_kind, names = {}, {}
+    for n in nested:
+        by_kind[n.entry.kind] = by_kind.get(n.entry.kind, 0) + n.bytes
+        names[n.rel[-1]] = names.get(n.rel[-1], 0) + n.bytes
+    elsewhere = sum(by_kind.values())
+    rec["whole_folder_bytes"] = it.bytes + elsewhere
+    rec["counted_elsewhere"] = {
+        "bytes": elsewhere,
+        "by_kind": dict(sorted(by_kind.items(), key=lambda kv: -kv[1])),
+        "names": [k for k, v in sorted(names.items(), key=lambda kv: -kv[1])[:3] if v > 0],
+    }
+    if rec["whole_folder_bytes"] >= BIG_UNKNOWN_BYTES:
+        top = sorted(it.grandchildren.items(), key=lambda kv: -kv[1])[:5]
+        rec["biggest_inside"] = [{"name": k, "bytes": v} for k, v in top if v > 0]
+    return rec
+
+
+def _base_record(it, home, now):
     top = sorted(it.children.items(), key=lambda kv: -kv[1])[:3]
     return {
         "rel": "/".join(it.rel),
@@ -716,6 +806,46 @@ def _record(it, home, now):
         "partial": it.partial,
         "biggest_inside": [{"name": k, "bytes": v} for k, v in top if v > 0],
     }
+
+
+def _volume_used(home):
+    """The data volume's own used space, as Finder counts it (APFS shares free space
+    between the volumes of one container). None when macOS does not say."""
+    try:
+        env = dict(os.environ, LC_ALL="C")
+        df = subprocess.run(["df", "-P", home], capture_output=True, text=True, timeout=10,
+                            env=env, stdin=subprocess.DEVNULL)
+        mount = df.stdout.splitlines()[1].split(None, 5)[5]
+        info = subprocess.run(["diskutil", "info", "-plist", mount], capture_output=True,
+                              timeout=10, stdin=subprocess.DEVNULL)
+        used = plistlib.loads(info.stdout).get("CapacityInUse")
+        return int(used) if used else None
+    except (OSError, IndexError, ValueError, subprocess.SubprocessError, plistlib.InvalidFileException):
+        return None
+
+
+def disk_numbers(home, measured, not_measured_count):
+    usage = shutil.disk_usage(home)
+    volume_used = _volume_used(home)
+    used = volume_used if volume_used is not None else usage.used
+    return {
+        "total": usage.total,
+        "free": usage.free,
+        "used": usage.used,
+        "data_volume_used": volume_used,
+        "home_measured": measured,
+        "outside_home_or_not_measured": max(0, used - measured),
+        "system_and_other_volumes": (max(0, usage.used - volume_used)
+                                     if volume_used is not None else None),
+        "not_measured_count": not_measured_count,
+        "note": ("Approximate. Free space here does not count purgeable space; Finder does, "
+                 "so Finder can show more free space."),
+    }
+
+
+def _short(rel):
+    """At most three folder names under home, for progress lines: never file names."""
+    return disp("/".join(rel[:3])) + ("/..." if len(rel) > 3 else "")
 
 
 def diff_scans(prev, cur):
@@ -812,9 +942,7 @@ def render_scan(result, changes):
     if not result["complete"]:
         head += " INCOMPLETE: " + result["incomplete_reason"] + "."
     out.append(head)
-    d = result["disk"]
-    out.append(f"Disk: {fmt_bytes(d['free'])} free of {fmt_bytes(d['total'])}.")
-    out.append(f"Measured in the home folder: {fmt_bytes(result['measured_bytes'])}.")
+    out.extend(render_disk(result["disk"]))
     for kind, label in KINDS.items():
         rows = [r for r in result["items"]
                 if r["kind"] == kind and r["bytes"] >= LIST_MIN_BYTES]
@@ -823,12 +951,27 @@ def render_scan(result, changes):
         for r in rows[:TEXT_TOP]:
             size = ("at least " if r["partial"] else "") + fmt_bytes(r["bytes"])
             out.append(f"  {size:>10}  {disp(r['rel'])}  {r['description']}")
+            pad = f"  {'':>10}  "
+            elsewhere = r.get("counted_elsewhere") or {}
+            if elsewhere.get("bytes", 0) >= max(LIST_MIN_BYTES, 1):
+                kinds = ", ".join(f"{k} {fmt_bytes(v)}" for k, v in elsewhere["by_kind"].items())
+                out.append(f"{pad}the whole folder is {fmt_bytes(r['whole_folder_bytes'])}; "
+                           f"{fmt_bytes(elsewhere['bytes'])} of it is counted above "
+                           f"({kinds}: {', '.join(elsewhere['names'])})")
             if kind in ("user", "unknown") and r["biggest_inside"]:
                 inside = ", ".join(f"{c['name']} {fmt_bytes(c['bytes'])}"
                                    for c in r["biggest_inside"])
-                out.append(f"  {'':>10}  biggest inside: {inside}")
+                label = "the rest is mostly in" if elsewhere.get("bytes") else "biggest inside"
+                out.append(f"{pad}{label}: {inside}")
         if len(rows) > TEXT_TOP:
             out.append(f"  ... and {len(rows) - TEXT_TOP} more")
+    if result.get("not_reached"):
+        out.append("")
+        out.append("Not reached before the time limit (sizes there are missing or partial):")
+        for r in result["not_reached"][:10]:
+            out.append(f"  {disp(r['rel'])} ({r['status']})")
+        if len(result["not_reached"]) > 10:
+            out.append(f"  ... and {len(result['not_reached']) - 10} more")
     blocked = result["not_measured"]
     if blocked:
         out.append("")
@@ -842,6 +985,23 @@ def render_scan(result, changes):
     out.append("")
     out.extend(render_changes(changes))
     return "\n".join(out)
+
+
+def render_disk(d):
+    lines = [f"Disk: {fmt_bytes(d['total'])}, {fmt_bytes(d['free'])} free "
+             "(Finder may show more free: it also counts purgeable space)."]
+    used = d["data_volume_used"] if d.get("data_volume_used") is not None else d["used"]
+    where = "Your data uses" if d.get("data_volume_used") is not None else "Used"
+    missing = d.get("not_measured_count", 0)
+    tail = (f" or in the {missing} folder{'s' if missing != 1 else ''} not measured"
+            if missing else "")
+    lines.append(f"{where} {fmt_bytes(used)}: {fmt_bytes(d['home_measured'])} measured in your "
+                 f"home folder, {fmt_bytes(d['outside_home_or_not_measured'])} outside it "
+                 f"(apps, macOS data, other user accounts){tail}.")
+    if d.get("system_and_other_volumes"):
+        lines.append(f"macOS itself, swap and snapshots use another "
+                     f"{fmt_bytes(d['system_and_other_volumes'])}.")
+    return lines
 
 
 def render_changes(ch):
@@ -862,6 +1022,8 @@ def render_changes(ch):
 
 
 def _duration(seconds):
+    if seconds < 10 and seconds != int(seconds):
+        return f"{seconds:.1f} s"
     seconds = int(round(seconds))
     if seconds < 60:
         return f"{seconds} s"
@@ -1091,10 +1253,10 @@ def measure_many(home, rels, time_limit, stall_limit):
                     subs[name] = root
             return subs
 
-        def on_no_answer(rel, root, why):
+        def on_no_answer(rel, root, why, _waited):
             res[root]["no_answer" if why == "no-answer" else "unreadable"] = True
 
-        timed_out = walk(home, {r: r for r in batch}, on_listing,
+        timed_out, _pending = walk(home, {r: r for r in batch}, on_listing,
                          max(0.0, deadline - time.monotonic()), stall_limit,
                          describe_roots=True, on_no_answer=on_no_answer)
         if timed_out:
@@ -1465,19 +1627,23 @@ How cleaning works
 Privacy prompts and time limits
   macOS may ask whether your terminal may access Documents, Desktop or other apps' data.
   While such a prompt waits, macOS holds the folder; if nobody answers within {stall},
-  the tool skips that folder and goes on. Folders macOS keeps closed or holds are shown
+  the tool skips that folder and goes on (folders next to it get {sibling}). Folders
+  macOS usually guards, and cloud drives, are scanned last. Folders macOS keeps closed or holds are shown
   as "not measured", never as empty. To measure them, give your terminal app Full Disk
   Access (System Settings > Privacy & Security).
 
-A scan takes a few minutes, prints what it is doing every few seconds, and stops after
-{limit} at most, reporting what it has measured by then.
+A scan takes a few minutes, prints which folder it is in every few seconds (never file
+names), and stops after {limit} at most, reporting what it measured and what it did
+not reach. The disk line shows how much of the used space is in your home folder; the
+rest is apps, macOS data and other user accounts, which it does not scan.
 """
 
 
 def cmd_explain(args, home):
     print(EXPLAIN.format(name=NAME, policy=policy_path(home), state=state_dir(home),
                          tool=tool_dir(), limit=_duration(DEFAULT_TIME_LIMIT),
-                         stall=_duration(STALL_LIMIT)))
+                         stall=_duration(STALL_LIMIT),
+                         sibling=_duration(SIBLING_STALL_LIMIT)))
     last = latest_scan(home)
     if last is None:
         print("Last scan: never")

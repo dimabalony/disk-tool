@@ -39,8 +39,12 @@ now. Later, ask *"what's on my disk?"* and it leads with what changed since last
 Folders macOS keeps private (Mail, Messages, some app data) show as *not measured*, never as
 empty. macOS may ask whether your terminal may open some of them; answer or ignore it. A
 folder macOS holds for more than 20 seconds is skipped, and a whole scan stops after 10
-minutes with what it has and names what it did not reach, so it never hangs. It only
-scans your home folder; the report says how much of the used space lies outside it. To measure those folders, give your terminal
+minutes with what it has and names what it did not reach, so it never hangs.
+
+Outside your home folder it only adds up sizes, read-only, of /Applications, /Library,
+/Users/Shared, /private/var, /opt and /usr/local, names other accounts on the Mac without
+looking inside them, and counts local Time Machine snapshots. Nothing outside your home
+folder is ever offered for cleaning. To measure those folders, give your terminal
 app Full Disk Access in System Settings › Privacy & Security.
 
 ## What it never does
@@ -48,8 +52,9 @@ app Full Disk Access in System Settings › Privacy & Security.
 - Open or read your files. It looks at sizes and dates only.
 - Use the network or send anything anywhere. No telemetry.
 - Remove your own files (*user*) or anything it does not recognise (*unknown*).
-- Remove anything outside your home folder, follow a link out of it, or touch a git project
-  with uncommitted or unpushed work.
+- Look inside another account's folder, or remove anything outside your home folder.
+- Follow a link out of your home folder, or touch a git project with uncommitted or
+  unpushed work.
 - Run by itself. If you want a weekly scan, Claude gives you the line to add; it never
   installs one.
 

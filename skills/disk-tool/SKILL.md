@@ -19,13 +19,19 @@ other cleaners. Everything goes through the tool.
 2. Run `disk-tool scan --json --time-limit 540` (give the shell call a 10-minute timeout).
    Never pass `--home`: that is for tests. macOS may show the user a prompt asking whether
    the terminal may open a folder; tell them before the scan that they can answer it or
-   ignore it. A folder macOS holds for more than 20 seconds is skipped, never waited on.
+   ignore it. A folder macOS holds for more than 20 seconds is skipped, never waited on;
+   the scan also adds up a few folders outside the home folder, read-only.
 3. Tell the user the result in plain words, short:
    - On a later run, lead with `changes`: free space then and now, what is new, what grew,
      what shrank.
-   - Free space, and where the used space is (`disk`): how much is in the home folder and
-     how much is outside it (apps, macOS data, other accounts, not scanned) or not
-     measured. Free space is approximate: Finder also counts purgeable space as free.
+   - Free space, and where the used space is (`disk`): home folder, the folders outside it
+     (`outside`: /Applications, /Library, /private/var, /opt …, each with its biggest
+     contents), and the rest it could not measure (other accounts, which it never looks
+     into, and system data the account may not read). Free space is approximate: Finder
+     also counts purgeable space as free. Mention local Time Machine snapshots if any.
+   - Nothing outside the home folder is ever a clean candidate. If something there is big
+     (Xcode in /Applications, Homebrew in /opt), say what it is and that removing it is
+     the user's call, done with the app's own uninstaller or `brew`, not with this tool.
    - The biggest things, each with its kind in words: cache (comes back by itself),
      temporary, developer files, app data, your files, not in the catalog.
    - Say which space is cache and which is not.

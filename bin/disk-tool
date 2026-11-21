@@ -974,7 +974,10 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
         for rel, owner in rows:
             mark(rel, owner)
         reason = "skipped-after-stalls" if why == "parent" else "skipped-stall-budget"
-        not_measured.append({"rel": "/".join(parent), "reason": reason, "count": len(rows)})
+        # names: which folders were skipped, so the next scan can tell "measured now,
+        # skipped last time" from "new" (saved scans only; not in `scan --json`)
+        not_measured.append({"rel": "/".join(parent), "reason": reason, "count": len(rows),
+                             "names": sorted(rel[-1] for rel, _ in rows)})
         if progress:
             print(f"  {_short(parent)}: {_skipped_text(reason, len(rows))}",
                   file=sys.stderr, flush=True)
@@ -1286,13 +1289,21 @@ def diff_scans(prev, cur):
     before = {r["rel"]: r for r in prev.get("items", [])
               if not (_inside(r["rel"], private) and r["rel"] not in private)}
     after = {r["rel"]: r for r in cur["items"]}
-    new, grown, shrunk = [], [], []
+    unseen = _not_measured_in(prev)
+    new, grown, shrunk, newly = [], [], [], []
+    kinds = {k: cur["kinds"][k] - prev.get("kinds", {}).get(k, 0) for k in KINDS}
     for rel, r in after.items():
         old = before.get(rel)
         row = {"rel": rel, "kind": r["kind"], "description": r["description"],
                "bytes": r["bytes"], "before": old["bytes"] if old else 0}
         row["change"] = row["bytes"] - row["before"]
-        if old is None:
+        # Not measured (or only partly) last time: its size now is not a change.
+        if (unseen(rel) if old is None else old.get("partial") and row["change"] > 0):
+            row["last_time"] = "not measured" if old is None else "partly measured"
+            kinds[r["kind"]] = kinds.get(r["kind"], 0) - row["change"]
+            if row["change"] >= CHANGE_MIN_BYTES:
+                newly.append(row)
+        elif old is None:
             if r["bytes"] >= CHANGE_MIN_BYTES:
                 new.append(row)
         elif row["change"] >= CHANGE_MIN_BYTES:
@@ -1307,12 +1318,35 @@ def diff_scans(prev, cur):
         available=True,
         free_before=prev["disk"]["free"], free_now=cur["disk"]["free"],
         free_change=cur["disk"]["free"] - prev["disk"]["free"],
-        kinds={k: cur["kinds"][k] - prev.get("kinds", {}).get(k, 0) for k in KINDS},
+        kinds=kinds,
         new=sorted(new, key=lambda r: -r["change"]),
         grown=sorted(grown, key=lambda r: -r["change"]),
         shrunk=sorted(shrunk, key=lambda r: r["change"]),
+        newly_measured=sorted(newly, key=lambda r: -r["change"]),
     )
     return out
+
+
+def _not_measured_in(scan):
+    """A test: was `rel` possibly left unmeasured by this (earlier) scan? Covers folders
+    it could not read, folders it skipped, and areas it did not reach. A skipped row
+    saved before the tool kept `names` covers its whole parent (unknown, so not "new")."""
+    if "not_measured" not in scan and not scan.get("complete", False):
+        return lambda rel: True
+    areas, whole = [r["rel"] for r in scan.get("not_reached", [])], []
+    for r in scan.get("not_measured", []):
+        if not r["reason"].startswith("skipped"):
+            areas.append(r["rel"])
+        elif "names" in r:
+            areas += [r["rel"] + "/" + n for n in r["names"]]
+        else:
+            whole.append(r["rel"])
+
+    def test(rel):
+        if any(a == "" or rel == a or rel.startswith(a + "/") for a in areas):
+            return True
+        return any(rel.startswith(w + "/") for w in whole)
+    return test
 
 
 def save_scan(home, result):
@@ -1339,12 +1373,13 @@ def scan_view(result, changes, top):
     view = {k: v for k, v in result.items() if k not in ("items", "kinds", "not_measured")}
     view["outside"] = result.get("outside", {"scanned": False})
     view["kinds"] = kinds
-    view["not_measured"] = blocked[:NOT_MEASURED_TOP]
+    view["not_measured"] = [{k: v for k, v in r.items() if k != "names"}
+                            for r in blocked[:NOT_MEASURED_TOP]]
     view["not_measured_total"] = len(blocked)
     if any(r["reason"] in ("privacy", "no-answer") for r in blocked):
         view["not_measured_hint"] = FDA_HINT
     trimmed = dict(changes)
-    for key in ("new", "grown", "shrunk"):
+    for key in ("new", "grown", "shrunk", "newly_measured"):
         if key in trimmed:
             trimmed[key] = trimmed[key][:top]
     view["changes"] = trimmed
@@ -1484,6 +1519,16 @@ def render_changes(ch):
                          f"  ({r['kind']}, now {fmt_bytes(r['bytes'])})")
     if not (ch["new"] or ch["grown"] or ch["shrunk"]):
         lines.append(f"  Nothing changed by more than {fmt_bytes(CHANGE_MIN_BYTES)}.")
+    newly = ch.get("newly_measured") or []
+    if newly:
+        lines.append("  Measured now, skipped last time (not a change, so not counted above):")
+        for r in newly[:TEXT_TOP]:
+            last = ("not measured" if r["last_time"] == "not measured"
+                    else f"only partly measured, at least {fmt_bytes(r['before'])}")
+            lines.append(f"    {fmt_bytes(r['bytes']):>10}  {disp(r['rel'])}"
+                         f"  ({r['kind']}; last time {last})")
+        if len(newly) > TEXT_TOP:
+            lines.append(f"    ... and {len(newly) - TEXT_TOP} more")
     return lines
 
 
@@ -1723,6 +1768,9 @@ def scrub_saved(home, folder):
         data["items"] = kept
         data["not_measured"] = [r for r in data.get("not_measured", [])
                                 if not r["rel"].startswith(folder + "/")]
+        for r in data["not_measured"]:
+            if r["rel"] == folder:
+                r.pop("names", None)  # names inside it; without them the whole is unknown
         data["not_reached"] = [r for r in data.get("not_reached", [])
                                if not r["rel"].startswith(folder + "/")]
         _write_json(path, data)

@@ -28,7 +28,10 @@ class StallBudgetTest(HomeTestCase):
         took = time.monotonic() - started
         rows = result["not_measured"]
         self.assertEqual(sum(r["reason"] == "no-answer" for r in rows), 3)
-        grouped = [r for r in rows if r["reason"] == "skipped-after-stalls"]
+        grouped = [dict(r) for r in rows if r["reason"] == "skipped-after-stalls"]
+        skipped = grouped[0].pop("names")  # kept so the next scan does not call them new
+        self.assertEqual(len(skipped), 3)
+        self.assertTrue(set(skipped) <= set(names), skipped)
         self.assertEqual(grouped, [{"rel": "Library/Containers",
                                     "reason": "skipped-after-stalls", "count": 3}])
         listed = {r["rel"] for r in result["items"]}

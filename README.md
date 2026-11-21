@@ -29,7 +29,9 @@ now. Later, ask *"what's on my disk?"* and it leads with what changed since last
    | user | your own files | Documents, Desktop, Downloads, Pictures, Movies, Music |
    | unknown | anything else that is big | you judge these |
 
-   It keeps the result, so the next scan can say what is new or has grown.
+   It keeps the result, so the next scan can say what is new or has grown. Something the
+   last scan skipped or measured only partly is shown apart, as *measured now, skipped last
+   time*, and is not counted as new or grown.
 2. **Policy.** One small file, `~/.config/disk-tool/policy.json`, says per kind or per item:
    *keep*, *ask*, or *clean when unused for N days*. The defaults clean only caches that
    rebuild themselves, after 30 days unused. Claude writes it only after you agree.

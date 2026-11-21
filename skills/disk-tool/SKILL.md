@@ -29,7 +29,9 @@ other cleaners. Everything goes through the tool.
    the scan also adds up a few folders outside the home folder, read-only.
 3. Tell the user the result in plain words, short:
    - On a later run, lead with `changes`: free space then and now, what is new, what grew,
-     what shrank.
+     what shrank. `changes.newly_measured` is what the last scan skipped or measured only
+     partly (`last_time`): say it was measured now and skipped last time, never call it
+     new or grown. `changes.kinds` already leaves it out.
    - Free space, and where the used space is (`disk`): home folder, the folders outside it
      (`outside`: /Applications, /Library, /private/var, /opt …, each with its biggest
      contents), and the rest it could not measure (other accounts, which it never looks

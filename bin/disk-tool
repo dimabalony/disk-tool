@@ -125,6 +125,10 @@ CATALOG = [
       "Simulator caches. The simulator rebuilds them.", auto_clean=True),
     E("npm-cache", "cache", ".npm/_cacache", "auto",
       "npm download cache. npm downloads again what it needs.", auto_clean=True),
+    E("npx-cache", "cache", ".npm/_npx", "auto",
+      "Packages npx downloaded to run commands that are not in a project. npx downloads "
+      "them again the next time you run one; `npm cache npx rm` also clears it.",
+      auto_clean=True),
     E("pnpm-store", "cache", "Library/pnpm/store", "auto",
       "pnpm package store. `pnpm install` fills it again.", auto_clean=True),
     E("pnpm-store-xdg", "cache", ".local/share/pnpm/store", "auto",
@@ -158,6 +162,9 @@ CATALOG = [
     # temp
     E("trash", "temp", ".Trash/*", "no",
       "In the Trash. Gone for good once removed."),
+    E("gradle-tmp", "temp", ".gradle/.tmp", "auto",
+      "Gradle's temporary files (worker classpaths, JDK downloads being unpacked). Gradle "
+      "makes new ones as it needs them; remove only while no Gradle build is running."),
     E("logs", "temp", "Library/Logs/*", "auto",
       "Log files. Apps write new ones; the old lines are gone."),
     E("device-support", "temp", "Library/Developer/Xcode/*OS DeviceSupport/*", "auto",
@@ -179,6 +186,10 @@ CATALOG = [
       "Node.js versions installed with nvm. `nvm install` brings one back."),
     E("pyenv-versions", "dev", ".pyenv/versions", "command",
       "Python versions installed with pyenv. `pyenv install` brings one back."),
+    E("konan", "dev", ".konan", "auto",
+      "Kotlin/Native compiler downloads (the compiler, LLVM, system libraries) and its "
+      "compiled-library cache. Gradle downloads them again on the next Kotlin Multiplatform "
+      "build that needs them, which can take long."),
     E("rustup-toolchains", "dev", ".rustup/toolchains", "command",
       "Rust toolchains. `rustup toolchain install` brings one back."),
     E("huggingface", "dev", ".cache/huggingface", "command",
@@ -195,8 +206,9 @@ CATALOG = [
       "`docker system prune` or Docker Desktop's settings, never by removing this.",
       protected=True),
     E("colima", "dev", ".colima", "no",
-      "Colima virtual machine disk: your Docker images and containers. Free space with "
-      "`docker system prune`.", protected=True),
+      "Colima's virtual machine disks: your Docker images, containers and volumes. Never "
+      "delete this folder; free space from inside with `docker system prune`, then restart "
+      "Colima so macOS gets the space back.", protected=True),
     E("lima", "dev", ".lima", "no",
       "Lima virtual machine disks. Remove machines with `limactl delete`.", protected=True),
     E("orbstack", "dev", ".orbstack", "no",
@@ -209,6 +221,9 @@ CATALOG = [
       "App data and settings."),
     E("app-support", "apps", "Library/Application Support/*", "no",
       "An app's data and settings."),
+    E("macos-aerials", "apps", "Library/Application Support/com.apple.wallpaper/aerials", "auto",
+      "Aerial wallpaper and screen saver videos macOS downloaded. Choose and manage them in "
+      "System Settings > Wallpaper; this tool never removes them.", protected=True),
     E("app-container", "apps", "Library/Containers/*", "no",
       "A sandboxed app's data and settings."),
     E("app-group-container", "apps", "Library/Group Containers/*", "no",

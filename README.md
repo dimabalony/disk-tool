@@ -49,6 +49,24 @@ looking inside them, and counts local Time Machine snapshots. Nothing outside yo
 folder is ever offered for cleaning. To measure those folders, give your terminal
 app Full Disk Access in System Settings › Privacy & Security.
 
+## Never surprised by a full disk
+
+`watch` is made to run on a schedule you add yourself, for example daily with `crontab -e`:
+
+```text
+0 10 * * * ~/.local/share/disk-tool/bin/disk-tool watch >/dev/null 2>&1
+```
+
+Each run scans, compares with the last scan and adds one line to
+`~/.local/state/disk-tool/changes.jsonl`: free space then and now, and the 20 biggest
+items that are new, grew, shrank or are gone. It alerts when free space is below 40 GB,
+dropped by more than 5 GB since the last scan, or one item grew by more than 3 GB
+(`--min-free-gb`, `--max-drop-gb`, `--max-item-growth-gb` change these). An alert prints
+the free space and the biggest causes, shows a macOS notification (`--no-notify` turns it
+off) and exits with code 3; otherwise it prints one line and exits with 0.
+`watch --log [N]` prints the last N runs in plain words. Private folders appear there as
+their path and total only.
+
 ## Private folders
 
 If a folder holds work whose contents must not show up anywhere, such as an employer's
@@ -71,7 +89,7 @@ them and `private remove` undoes one. They live in `~/.config/disk-tool/private.
 - Look inside another account's folder, or remove anything outside your home folder.
 - Follow a link out of your home folder, or touch a git project with uncommitted or
   unpushed work.
-- Run by itself. If you want a weekly scan, Claude gives you the line to add; it never
+- Run by itself. If you want a daily check, Claude gives you the line to add; it never
   installs one.
 
 ## Without Claude
@@ -85,6 +103,8 @@ $T scan             # what is on the disk, and what changed
 $T policy init      # write the safe default rules (policy show / policy set to change them)
 $T clean            # dry run: what the rules would remove
 $T clean --apply    # remove exactly that list
+$T watch            # for a schedule: scan, log what changed, alert when space runs low
+$T watch --log      # what changed on the disk, and when
 ```
 
 Requirements: macOS and `python3` 3.9 or newer (it comes with the Xcode Command Line Tools).

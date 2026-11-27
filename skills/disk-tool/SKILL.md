@@ -78,14 +78,25 @@ other cleaners. Everything goes through the tool.
 
 ## Regular scans
 
-If the user wants it to run on a schedule, give them this line to add themselves with
-`crontab -e` (Sundays at 10:00), and say what it does:
+If the user wants it to run on a schedule, offer `watch`: it scans, adds one line to a
+change log (free space then and now, the biggest items that are new, grew, shrank or are
+gone), and warns them before the disk is full. Give them this line to add themselves with
+`crontab -e` (every day at 10:00, while the Mac is awake), and say what it does:
 
-    0 10 * * 0 ~/.local/share/disk-tool/bin/disk-tool scan >/dev/null 2>&1
+    0 10 * * * ~/.local/share/disk-tool/bin/disk-tool watch >/dev/null 2>&1
+
+An alert means free space is below 40 GB, dropped by more than 5 GB since the last scan,
+or one item grew by more than 3 GB. Then `watch` exits with code 3 and shows a macOS
+notification naming the free space and the biggest causes. Other limits go on the same
+line: `--min-free-gb N`, `--max-drop-gb N`, `--max-item-growth-gb N`.
 
 Never install it yourself: no `crontab`, `launchctl` or login items. Cleaning on a schedule
 is their choice too; the line for that is
 `disk-tool scan >/dev/null && disk-tool clean && disk-tool clean --apply` (full paths).
+
+When the user asks what changed on the disk, or why space went, run `disk-tool watch --log`
+(last 10 runs; `--log N` for more) and tell them in plain words what changed and when. It
+does not scan. If it says there is no change log yet, run step 2 instead.
 
 ## If something fails
 

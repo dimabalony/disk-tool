@@ -1724,9 +1724,14 @@ def render_alert(e, log_path):
         for r in causes:
             out.append(f"  {fmt_bytes(r['delta'], sign=True):>10}  {r['path']}"
                        f"  ({r['kind']}, {r['change']}, now {fmt_bytes(r['bytes'])})")
+    elif e.get("baseline"):
+        out.append("First run: the next run shows what changed.")
     elif e.get("compared"):
-        out.append(f"Nothing in the home folder grew by more than {fmt_bytes(CHANGE_MIN_BYTES)}"
-                   ": the space went outside it (apps, system data, other accounts).")
+        text = (f"Nothing in the home folder grew by more than {fmt_bytes(CHANGE_MIN_BYTES)}"
+                " since the last scan")
+        if (e.get("free_change") or 0) < -CHANGE_MIN_BYTES:
+            text += ": the space went outside it (apps, system data, other accounts)"
+        out.append(text + ".")
     elif e.get("note"):
         out.append(f"Not compared item by item: {e['note']}.")
     out.append(f"Logged in {log_path}; `{NAME} watch --log` shows the history.")
@@ -2492,6 +2497,12 @@ What it does
            report shows only its path and total size. Nothing inside it is listed,
            saved, shown while scanning, or ever cleaned; adding one also removes what
            earlier saved scans recorded inside it.
+  watch    For a schedule you set up yourself: scans, adds one line to a change log
+           (free space then and now, the biggest items that are new, grew, shrank or
+           are gone), and exits with code 3 and a macOS notification when free space
+           is below {min_free} GB, dropped by more than {max_drop} GB, or one item grew by more
+           than {max_item} GB (change these with --min-free-gb, --max-drop-gb, --max-item-growth-gb).
+           `{name} watch --log` shows what changed and when.
 
 What it never does
   - It never opens or reads your files: it looks at sizes and dates only.
@@ -2506,6 +2517,7 @@ Where it keeps its files
   Your rules:  {policy}
   Private:     {private}
   Scans:       {state}
+  Change log:  {changelog}
   The tool:    {tool}
 
 How cleaning works
@@ -2533,7 +2545,9 @@ system data your account may not read).
 
 def cmd_explain(args, home):
     print(EXPLAIN.format(name=NAME, policy=policy_path(home), private=private_path(home),
-                         state=state_dir(home),
+                         state=state_dir(home), changelog=change_log_path(home),
+                         min_free=WATCH_MIN_FREE_GB, max_drop=WATCH_MAX_DROP_GB,
+                         max_item=WATCH_MAX_ITEM_GROWTH_GB,
                          tool=tool_dir(), limit=_duration(DEFAULT_TIME_LIMIT),
                          stall=_duration(STALL_LIMIT),
                          sibling=_duration(SIBLING_STALL_LIMIT),

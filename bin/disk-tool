@@ -1565,6 +1565,7 @@ def scan_and_save(args, home, progress):
                        root=outside_root(args.home is not None or ENV_HOME in os.environ))
     changes = diff_scans(prev, result)
     save_scan(home, result)
+    update_first_seen(home, prev, result)
     return prev, result, changes
 
 
@@ -1714,7 +1715,7 @@ def _causes(e):
     return [r for r in e.get("items", []) if r["delta"] > 0][:WATCH_CAUSES]
 
 
-def render_alert(e, log_path):
+def render_alert(e, log_path, undecided=None):
     since = f" since {when(e['since_epoch'])}" if e.get("since_epoch") else ""
     out = [f"{NAME} watch: ALERT. {_cap(_free_text(e))}{since}.",
            "Why: " + "; ".join(e["reasons"]) + "."]
@@ -1735,6 +1736,8 @@ def render_alert(e, log_path):
     elif e.get("note"):
         out.append(f"Not compared item by item: {e['note']}.")
     out.append(f"Logged in {log_path}; `{NAME} watch --log` shows the history.")
+    if undecided:
+        out.append(undecided)
     return "\n".join(out)
 
 
@@ -1813,7 +1816,7 @@ def cmd_watch(args, home):
             print(f"{NAME} watch: {_free_text(entry)} since {when(entry['since_epoch'])}; "
                   f"{n} change{'s' if n != 1 else ''} logged. No alert.")
         return 0
-    print(render_alert(entry, change_log_path(home)))
+    print(render_alert(entry, change_log_path(home), undecided_summary(home, result)))
     if not args.no_notify:
         try:
             notify(f"{NAME}: disk space", _notification_text(entry))
@@ -1828,7 +1831,8 @@ ACTIONS = ("keep", "ask", "clean")
 POLICY_ABOUT = (
     "Cleaning rules. keep = never touch. ask = list it so you decide. clean = remove when "
     "nothing in it changed for older_than_days (only when you run clean --apply). "
-    "'items' (catalog ids) override 'kinds'. 'user' and 'unknown' can never be clean.")
+    "'items' (catalog ids) override 'kinds'; 'paths' (one item, as a path under home) "
+    "override both. 'user' and 'unknown' can never be clean.")
 
 
 class PolicyError(Exception):
@@ -1875,6 +1879,11 @@ def validate_policy(data):
             warnings.append(f"policy: '{item_id}' is not in the catalog any more; ignored")
             continue
         _check_rule(item_id, rule, entry.kind, entry.protected)
+    paths = data.get("paths", {})
+    if not isinstance(paths, dict):
+        raise PolicyError("'paths' must be an object")
+    for rel, rule in paths.items():  # kinds are checked by `policy set` and rule_for
+        _check_rule(disp(rel), rule, None, False)
     return warnings
 
 
@@ -1894,9 +1903,11 @@ def load_policy(home, required=True):
     return data
 
 
-def rule_for(policy, entry):
-    """The rule that applies to a catalog entry: its own, else its kind's, else ask."""
-    rule = policy.get("items", {}).get(entry.id) or policy.get("kinds", {}).get(entry.kind)
+def rule_for(policy, entry, rel=None):
+    """The rule that applies to one item: its path's (rel, "a/b"), else its catalog
+    entry's, else its kind's, else ask."""
+    rule = ((policy.get("paths", {}).get(rel) if rel is not None else None)
+            or policy.get("items", {}).get(entry.id) or policy.get("kinds", {}).get(entry.kind))
     rule = dict(rule or {"action": "ask"})
     if entry.kind in NEVER_CLEAN or entry.protected:
         if rule["action"] == "clean":  # belt and braces: validate_policy already refuses it
@@ -1908,6 +1919,35 @@ def _rule_text(rule):
     if rule["action"] == "clean":
         return f"clean when unused {rule['older_than_days']} days"
     return rule["action"]
+
+
+def _item_rel(home, arg):
+    """A path the user typed (~/x, /abs/x, x/y) -> "x/y" under home, which must be an
+    item of the last scan and not inside a private folder."""
+    if arg == "~" or arg.startswith("~/"):
+        path = os.path.join(home, arg[2:])
+    elif os.path.isabs(arg):
+        path = arg
+    else:
+        path = os.path.join(home, arg)
+    rel = os.path.relpath(os.path.normpath(path), home).replace(os.sep, "/")
+    if rel == "." or rel == ".." or rel.startswith("../"):
+        raise PolicyError(f"{arg} is not inside your home folder")
+    folder = _inside(rel, load_private(home))
+    if folder and folder != rel:
+        raise PolicyError(f"{disp(folder)} is private: nothing inside it gets a rule")
+    return rel
+
+
+def rel_id(home, rel):
+    scan = latest_scan(home)
+    if scan is None:
+        raise PolicyError(f"no scan yet; run `{NAME} scan` first")
+    for r in scan.get("items", []):
+        if r["rel"] == rel:
+            return r["id"]
+    raise PolicyError(f"{disp(rel)} is not an item from the last scan; use a path as "
+                      f"`{NAME} scan` or `{NAME} undecided` shows it")
 
 
 def cmd_policy(args, home):
@@ -1934,13 +1974,23 @@ def cmd_policy(args, home):
         if target in KINDS:
             _check_rule(target, rule, target, False)
             policy.setdefault("kinds", {})[target] = rule
+        elif target.startswith(("~", "/")) or "/" in target:
+            rel = _item_rel(home, target)
+            entry = ENTRIES.get(rel_id(home, rel), UNKNOWN)
+            if action == "clean" and entry.protected:
+                raise PolicyError(f"{disp(rel)} is never removed by this tool: "
+                                  f"{entry.description}")
+            _check_rule(disp(rel), rule, entry.kind, False)
+            policy.setdefault("paths", {})[rel] = rule
+            target = disp(rel)
         elif target in ENTRIES and target not in ("unknown", "private"):
             entry = ENTRIES[target]
             _check_rule(target, rule, entry.kind, entry.protected)
             policy.setdefault("items", {})[target] = rule
         else:
             raise PolicyError(f"'{target}' is not a kind or a catalog id; "
-                              f"see `{NAME} policy show --all`")
+                              f"see `{NAME} policy show --all`. For one folder, write "
+                              f"its path: ~/{target}")
         validate_policy(policy)
         _write_json(path, policy)
         note = " (the file did not exist, so it starts from the defaults)" if created else ""
@@ -1968,6 +2018,11 @@ def cmd_policy(args, home):
         entry = ENTRIES.get(item_id)
         where = entry.pattern if entry else "(not in the catalog)"
         print(f"  {item_id:<22} {_rule_text(rule):<28} ~/{where}")
+    if policy.get("paths"):
+        print()
+        print("By path (one item each; these override the item and the kind):")
+        for rel, rule in sorted(policy["paths"].items()):
+            print(f"  {_rule_text(rule):<28} {disp(rel)}")
     if args.all:
         print()
         print("Every catalog item (id, kind, where, what it is):")
@@ -1982,6 +2037,156 @@ def cmd_policy(args, home):
           "changed for N days, only when you run `clean --apply`.")
     if not args.all:
         print(f"All item ids: `{NAME} policy show --all`.")
+    return 0
+
+
+# ----------------------------------------------------------------------------- undecided
+
+FIRST_SEEN_FORGET = 180 * 86400  # an item unseen this long is forgotten (new if it returns)
+UNDECIDED_TEXT_TOP = 20
+FIRST_SEEN_ABOUT = ("When each item was first seen by a scan, and its size then. "
+                    f"Kept by {NAME} for `{NAME} undecided`; safe to delete.")
+
+
+def first_seen_path(home):
+    return os.path.join(state_dir(home), "first-seen.json")
+
+
+def load_first_seen(home):
+    data = _read_json(first_seen_path(home))
+    if not isinstance(data, dict) or not isinstance(data.get("items"), dict):
+        return None
+    return data
+
+
+def update_first_seen(home, prev, result):
+    """Note the items this scan saw for the first time. Without a file yet, the items
+    of the scan before this one count as first seen then."""
+    data = load_first_seen(home)
+    private = result.get("private", [])
+
+    def hidden(rel):
+        return _inside(rel, private) not in (None, rel)
+    if data is None:
+        data = {"about": FIRST_SEEN_ABOUT, "items": {}}
+        base = prev if prev and prev.get("scanned_at_epoch") else result
+        data["started_epoch"] = base["scanned_at_epoch"]
+        if base is prev:
+            t = prev["scanned_at_epoch"]
+            for r in prev.get("items", []):
+                if not hidden(r["rel"]):
+                    data["items"][r["rel"]] = {"first_seen_epoch": t, "first_bytes": r["bytes"],
+                                               "last_seen_epoch": t}
+    now = result["scanned_at_epoch"]
+    items = data["items"]
+    for r in result["items"]:
+        e = items.get(r["rel"])
+        if e is None:
+            items[r["rel"]] = {"first_seen_epoch": now, "first_bytes": r["bytes"],
+                               "last_seen_epoch": now}
+        else:
+            e["last_seen_epoch"] = now
+    data["items"] = {rel: e for rel, e in items.items()
+                     if not hidden(rel)
+                     and now - e.get("last_seen_epoch", now) <= FIRST_SEEN_FORGET}
+    _write_json(first_seen_path(home), data)
+
+
+def undecided_items(home, scan, policy):
+    """Items of a scan whose rule is `ask` (nothing decided them yet), biggest first.
+    Private folders: path, total and dates only."""
+    private = sorted(set(load_private(home)) | set(scan.get("private", [])))
+    seen = (load_first_seen(home) or {}).get("items", {})
+    rows = []
+    for r in scan["items"]:
+        if _inside(r["rel"], private) not in (None, r["rel"]) or r["bytes"] < LIST_MIN_BYTES:
+            continue
+        entry = PRIVATE if r["kind"] == "private" else ENTRIES.get(r["id"], UNKNOWN)
+        if rule_for(policy, entry, r["rel"])["action"] != "ask":
+            continue
+        first = seen.get(r["rel"])
+        row = {"path": disp(r["rel"]), "kind": r["kind"], "bytes": r["bytes"],
+               "first_seen": iso(first["first_seen_epoch"]) if first else None,
+               "first_seen_epoch": first["first_seen_epoch"] if first else None,
+               "grown_since_first_seen": r["bytes"] - first["first_bytes"] if first else None}
+        if entry is not PRIVATE:
+            row["id"] = entry.id
+            row["description"] = r["description"]
+        rows.append(row)
+    rows.sort(key=lambda row: -row["bytes"])
+    return rows
+
+
+def undecided_summary(home, scan):
+    """One line for the watch alert: how much is undecided."""
+    try:
+        policy = load_policy(home, required=False) or default_policy()
+        rows = undecided_items(home, scan, policy)
+    except PolicyError as exc:
+        return f"Undecided items not counted: {exc}."
+    n = len(rows)
+    return (f"{n} undecided item{'s' if n != 1 else ''}, {fmt_bytes(sum(r['bytes'] for r in rows))}"
+            f" in total: `{NAME} undecided` lists them biggest first.")
+
+
+def since_arg(text):
+    """--since: 30d (days back) or 2026-11-01 (a date). Returns an epoch."""
+    text = text.strip()
+    try:
+        if text.endswith("d") and text[:-1].isdigit():
+            return _now() - int(text[:-1]) * 86400
+        return time.mktime(datetime.datetime.strptime(text, "%Y-%m-%d").timetuple())
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("use a number of days such as 30d, or a date such as "
+                                     "2026-11-01")
+
+
+def cmd_undecided(args, home):
+    scan = latest_scan(home)
+    if scan is None:
+        print(f"No scan yet. Run `{NAME} scan` first.")
+        return 1
+    policy = load_policy(home, required=False) or default_policy()
+    rows = undecided_items(home, scan, policy)
+    if args.since is not None:
+        rows = [r for r in rows if r["first_seen_epoch"] is not None
+                and r["first_seen_epoch"] >= args.since]
+    started = (load_first_seen(home) or {}).get("started_epoch")
+    total = sum(r["bytes"] for r in rows)
+    if args.json:
+        print(json.dumps({
+            "scanned_at": scan.get("scanned_at"),
+            "first_seen_tracked_since": iso(started) if started else None,
+            "since": iso(args.since) if args.since is not None else None,
+            "count": len(rows), "bytes": total,
+            "items": [_public(r) for r in rows],
+        }, indent=2, ensure_ascii=False))
+        return 0
+    when_scanned = when(scan["scanned_at_epoch"])
+    scope = f" new since {when(args.since)[:10]}" if args.since is not None else ""
+    if not rows:
+        print(f"Nothing undecided{scope} in the last scan ({when_scanned}).")
+        return 0
+    n = len(rows)
+    print(f"Undecided{scope}: {n} item{'s' if n != 1 else ''}, {fmt_bytes(total)} in total, "
+          f"biggest first (last scan {when_scanned}). Your policy says ask for these and "
+          "nothing decided them yet.")
+    if started:
+        print(f"First-seen dates start at {when(started)[:10]}, when tracking began.")
+    for r in rows[:UNDECIDED_TEXT_TOP]:
+        what = r["kind"] if r.get("id") in (None, "unknown") else f"{r['kind']}: {r['id']}"
+        dates = ""
+        if r["first_seen_epoch"] is not None:
+            dates = f", first seen {when(r['first_seen_epoch'])[:10]}"
+            if r["grown_since_first_seen"]:
+                dates += f", {fmt_bytes(r['grown_since_first_seen'], sign=True)} since"
+        print(f"  {fmt_bytes(r['bytes']):>10}  {r['path']}  ({what}{dates})")
+    if n > UNDECIDED_TEXT_TOP:
+        rest = rows[UNDECIDED_TEXT_TOP:]
+        print(f"  ... and {len(rest)} more ({fmt_bytes(sum(r['bytes'] for r in rest))})")
+    print(f"Decide one: `{NAME} policy set <path> keep` (or ask, or clean --older-than-days N "
+          "for what the tool may clean). An id instead of a path decides every item with it.")
     return 0
 
 
@@ -2040,6 +2245,11 @@ def scrub_saved(home, folder):
                                if not r["rel"].startswith(folder + "/")]
         _write_json(path, data)
     scrub_change_log(home, folder)
+    seen = load_first_seen(home)
+    if seen:
+        seen["items"] = {rel: e for rel, e in seen["items"].items()
+                         if not rel.startswith(folder + "/")}
+        _write_json(first_seen_path(home), seen)
     plan = os.path.join(state, "clean-plan.json")
     if os.path.exists(plan):
         os.unlink(plan)
@@ -2221,7 +2431,7 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
     def rule(rec):
         if rec["rel"] not in rules:
             entry = ENTRIES.get(rec["id"], UNKNOWN)
-            rules[rec["rel"]] = (entry, rule_for(policy, entry))
+            rules[rec["rel"]] = (entry, rule_for(policy, entry, rec["rel"]))
         return rules[rec["rel"]]
 
     targets, recent = [], {"count": 0, "bytes": 0}
@@ -2488,8 +2698,12 @@ What it does
            (/Applications, /Library, /Users/Shared, /private/var, /opt, /usr/local),
            names other accounts without looking inside them, and counts local Time
            Machine snapshots. Nothing outside your home folder is ever cleaned.
-  policy   One small file with your rules, per kind or per item: keep, ask, or clean
-           when nothing in it changed for a number of days.
+  policy   One small file with your rules, per kind, per catalog item or per path:
+           keep, ask, or clean when nothing in it changed for a number of days.
+  undecided  What your rules say "ask" for and nothing decided yet, biggest first,
+           with the date each was first seen and how much it grew since
+           (`--since 30d` for only the new ones). Decide one with
+           `{name} policy set ~/path keep`; it then leaves the list.
   clean    Lists exactly what your rules would remove and how much that frees.
            Nothing is removed until you run it again with --apply.
   private  Folders whose contents must never be named, such as an employer's code or
@@ -2502,7 +2716,8 @@ What it does
            are gone), and exits with code 3 and a macOS notification when free space
            is below {min_free} GB, dropped by more than {max_drop} GB, or one item grew by more
            than {max_item} GB (change these with --min-free-gb, --max-drop-gb, --max-item-growth-gb).
-           `{name} watch --log` shows what changed and when.
+           `{name} watch --log` shows what changed and when. A "keep" item that
+           grows past the limit still alerts; keep means "never clean", not "never look".
 
 What it never does
   - It never opens or reads your files: it looks at sizes and dates only.
@@ -2591,7 +2806,8 @@ def main(argv=None):
     q = psub.add_parser("init", parents=[common], help="write the safe defaults")
     q.add_argument("--force", action="store_true", help="replace an existing policy")
     q = psub.add_parser("set", parents=[common], help="set one rule")
-    q.add_argument("target", help="a kind (cache, temp, dev, apps, user, unknown) or an item id")
+    q.add_argument("target", help="a kind (cache, temp, dev, apps, user, unknown), an item "
+                                  "id, or one item's path as scan shows it (~/Movies/old)")
     q.add_argument("action", choices=ACTIONS)
     q.add_argument("--older-than-days", type=int, metavar="DAYS",
                    help=f"for clean: unused this many days (default {DEFAULT_CLEAN_DAYS})")
@@ -2639,10 +2855,17 @@ def main(argv=None):
                    help="skip a folder macOS does not answer for this long (default "
                         f"{STALL_LIMIT}; a privacy prompt can hold a folder forever)")
 
+    p = sub.add_parser("undecided", parents=[common],
+                       help="items your policy says ask for and nothing decided yet")
+    p.add_argument("--since", type=since_arg, metavar="30d|YYYY-MM-DD",
+                   help="only items first seen since then")
+    p.add_argument("--json", action="store_true", help="print JSON (for agents)")
+
     args = parser.parse_args(argv)
     home = resolve_home(args.home)
     handler = {"scan": cmd_scan, "explain": cmd_explain, "policy": cmd_policy,
-               "clean": cmd_clean, "private": cmd_private, "watch": cmd_watch}[args.cmd]
+               "clean": cmd_clean, "private": cmd_private, "watch": cmd_watch,
+               "undecided": cmd_undecided}[args.cmd]
     try:
         return handler(args, home)
     except PolicyError as exc:

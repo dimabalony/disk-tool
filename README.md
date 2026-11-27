@@ -32,8 +32,8 @@ now. Later, ask *"what's on my disk?"* and it leads with what changed since last
    It keeps the result, so the next scan can say what is new or has grown. Something the
    last scan skipped or measured only partly is shown apart, as *measured now, skipped last
    time*, and is not counted as new or grown.
-2. **Policy.** One small file, `~/.config/disk-tool/policy.json`, says per kind or per item:
-   *keep*, *ask*, or *clean when unused for N days*. The defaults clean only caches that
+2. **Policy.** One small file, `~/.config/disk-tool/policy.json`, says per kind, per item
+   or per path: *keep*, *ask*, or *clean when unused for N days*. The defaults clean only caches that
    rebuild themselves, after 30 days unused. Claude writes it only after you agree.
 3. **Clean.** First a dry run: the exact list and how much it frees. Only after your yes to
    that list does it remove them, moving them to the Trash where it can.
@@ -66,6 +66,14 @@ the free space and the biggest causes, shows a macOS notification (`--no-notify`
 off) and exits with code 3; otherwise it prints one line and exits with 0.
 `watch --log [N]` prints the last N runs in plain words. Private folders appear there as
 their path and total only.
+
+Anything new that your policy says *ask* for is *undecided*. `undecided` lists those items
+biggest first, with the date each was first seen and how much it grew since
+(`--since 30d` keeps only what appeared lately). Decide one with
+`policy set ~/path keep` (or `clean --older-than-days N` where the tool may clean it):
+the decision is saved under `paths` in the policy file and the item leaves the list. An
+item you keep still shows in a watch alert when it grows past the limit. The alert's
+last line says how many items are undecided.
 
 ## Private folders
 
@@ -105,6 +113,8 @@ $T clean            # dry run: what the rules would remove
 $T clean --apply    # remove exactly that list
 $T watch            # for a schedule: scan, log what changed, alert when space runs low
 $T watch --log      # what changed on the disk, and when
+$T undecided        # what nothing decided yet, biggest first (--since 30d: only new)
+$T policy set ~/Movies/old keep   # decide one item; it leaves the undecided list
 ```
 
 Requirements: macOS and `python3` 3.9 or newer (it comes with the Xcode Command Line Tools).

@@ -64,6 +64,19 @@ other cleaners. Everything goes through the tool.
    change they asked for. Never set anything in `user` or `unknown` to clean (the tool
    refuses anyway).
 
+## Undecided items
+
+When the user is still short on space after a clean, or asks "what is new here?", run
+`disk-tool undecided` (`--since 30d` for only what appeared lately; `--json` for the
+fields). It lists what the policy says `ask` for and nothing decided yet, biggest first,
+with the date each was first seen and how much it grew since. Walk the biggest few with
+the user, one at a time: say what it is (kind, description, path), and ask keep or clean.
+Record each answer at once so it sticks:
+`disk-tool policy set ~/path keep`, or for what the tool may clean,
+`disk-tool policy set ~/path clean --older-than-days N`. An id instead of a path decides
+every item with that id. `unknown`, `user` and private folders can only be kept (the tool
+refuses clean). A private folder shows as its path and total only; never look inside it.
+
 ## Cleaning
 
 5. Run `disk-tool clean` (a dry run). Show its list and the total it frees, and what it
@@ -87,8 +100,9 @@ gone), and warns them before the disk is full. Give them this line to add themse
 
 An alert means free space is below 40 GB, dropped by more than 5 GB since the last scan,
 or one item grew by more than 3 GB. Then `watch` exits with code 3 and shows a macOS
-notification naming the free space and the biggest causes. Other limits go on the same
-line: `--min-free-gb N`, `--max-drop-gb N`, `--max-item-growth-gb N`.
+notification naming the free space and the biggest causes; its last line counts the
+undecided items. An item set to keep still alerts when it grows past the limit. Other
+limits go on the same line: `--min-free-gb N`, `--max-drop-gb N`, `--max-item-growth-gb N`.
 
 Never install it yourself: no `crontab`, `launchctl` or login items. Cleaning on a schedule
 is their choice too; the line for that is

@@ -160,6 +160,29 @@ class UndecidedTest(HomeTestCase):
         self.assertEqual(rc, 2)
         self.assertIn("is private", out)
 
+    def test_making_a_folder_private_drops_path_rules_inside_it(self):
+        self.write("Work/secret-zebra/x.bin", 300 * KB)
+        self.write("Work/package.json", 10)
+        self.write("Work/node_modules/dep/index.js", 200 * KB)
+        self.run_tool("scan", "--json")
+        rc, out = self.run_tool("policy", "set", "~/Work/node_modules", "keep")
+        self.assertEqual(rc, 0, out)
+        path = os.path.join(self.home, ".config/disk-tool/policy.json")
+        with open(path) as f:  # hand-written rules inside count too
+            policy = json.load(f)
+        policy["paths"]["Work/secret-zebra"] = {"action": "keep"}
+        policy["paths"]["Work"] = {"action": "keep"}
+        with open(path, "w") as f:
+            json.dump(policy, f)
+        rc, out = self.run_tool("private", "add", "~/Work")
+        self.assertEqual(rc, 0, out)
+        with open(path) as f:
+            self.assertEqual(json.load(f)["paths"], {"Work": {"action": "keep"}})
+        rc, out = self.run_tool("policy", "show")
+        self.assertIn("~/Work", out)
+        self.assertNotIn("zebra", out)
+        self.assertNotIn("node_modules", out)
+
     def test_first_seen_starts_from_the_scan_before_when_it_is_missing(self):
         self.build()
         self.run_tool("scan", "--json")

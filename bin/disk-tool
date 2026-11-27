@@ -2018,10 +2018,13 @@ def cmd_policy(args, home):
         entry = ENTRIES.get(item_id)
         where = entry.pattern if entry else "(not in the catalog)"
         print(f"  {item_id:<22} {_rule_text(rule):<28} ~/{where}")
-    if policy.get("paths"):
+    private = load_private(home)
+    paths = {rel: rule for rel, rule in policy.get("paths", {}).items()
+             if _inside(rel, private) in (None, rel)}
+    if paths:
         print()
         print("By path (one item each; these override the item and the kind):")
-        for rel, rule in sorted(policy["paths"].items()):
+        for rel, rule in sorted(paths.items()):
             print(f"  {_rule_text(rule):<28} {disp(rel)}")
     if args.all:
         print()
@@ -2245,6 +2248,13 @@ def scrub_saved(home, folder):
                                if not r["rel"].startswith(folder + "/")]
         _write_json(path, data)
     scrub_change_log(home, folder)
+    policy = _read_json(policy_path(home))
+    if isinstance(policy, dict) and isinstance(policy.get("paths"), dict):
+        inside = [rel for rel in policy["paths"] if rel.startswith(folder + "/")]
+        if inside:  # rules naming paths inside it would name what is inside
+            for rel in inside:
+                del policy["paths"][rel]
+            _write_json(policy_path(home), policy)
     seen = load_first_seen(home)
     if seen:
         seen["items"] = {rel: e for rel, e in seen["items"].items()

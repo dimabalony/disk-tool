@@ -85,6 +85,38 @@ class ContainerTest(HomeTestCase):
                          [".gradle/wrapper/dists/gradle-8.5-bin",
                           ".gradle/wrapper/dists/gradle-8.9-bin"])
 
+    def test_a_units_own_path_rule_beats_the_containers(self):
+        dd = "Library/Developer/Xcode/DerivedData"
+        self.write(f"{dd}/Keep-abc/Build/x.o", 100 * 1024)
+        self.write(f"{dd}/Old-def/Build/x.o", 100 * 1024)
+        self.run_tool("policy", "init")
+        import os
+        path = self.tool.policy_path(self.home)
+        with open(path) as f:
+            policy = json.load(f)
+        policy.setdefault("paths", {})[f"{dd}/Keep-abc"] = {"action": "keep"}
+        with open(path, "w") as f:
+            json.dump(policy, f)
+        self.run_tool("scan")
+        plan = self.plan()
+        self.assertEqual([r["rel"] for r in plan["remove"]], [f"{dd}/Old-def"])
+        left = {r["rel"]: r["reason"] for r in plan["left_alone"]}
+        self.assertEqual(left[f"{dd}/Keep-abc"], "your policy says keep")
+        self.assertEqual([r["rel"] for r in self.plan("--path", dd)["remove"]],
+                         [f"{dd}/Old-def"])  # keep holds for an explicit --path too
+        self.run_tool("clean")
+        self.run_tool("clean", "--apply")
+        self.assertTrue(os.path.isdir(os.path.join(self.home, dd, "Keep-abc")))
+
+    def test_the_printed_apply_command_names_what_was_asked(self):
+        self.write(".gradle/wrapper/dists/gradle-8.5-bin/abc/gradle-8.5/lib/a.jar")
+        self.run_tool("scan")
+        rc, out = self.run_tool("clean", "--path", ".gradle/wrapper/dists")
+        self.assertIn("clean --path .gradle/wrapper/dists --apply", out)
+        rc, out = self.run_tool("clean", "--path", ".gradle/wrapper/dists", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(self.exists(".gradle/wrapper/dists/gradle-8.5-bin"))
+
     def test_a_unit_holding_a_git_project_with_unsaved_work_stays(self):
         from helpers import HAS_GIT, git
         if not HAS_GIT:
@@ -176,6 +208,44 @@ class KotlinPinTest(HomeTestCase):
         self.run_tool("scan")
         with open(self.tool.state_dir(self.home) + "/latest.json") as f:
             self.assertEqual(json.load(f)["kotlin_pins"], [])
+
+    def test_a_catalog_that_cannot_be_read_keeps_every_compiler(self):
+        real = self.write("Developer/shared/libs.versions.toml", 0)
+        import os
+        os.makedirs(os.path.join(self.home, "Developer/app/gradle"))
+        os.symlink(real, os.path.join(self.home, "Developer/app/gradle/libs.versions.toml"))
+        self.run_tool("scan")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("could not read ~/Developer/app/gradle/libs.versions.toml",
+                      left[".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"])
+
+    def test_pins_are_read_again_at_apply(self):
+        cat = "Developer/app/gradle/libs.versions.toml"
+        self.catalog(cat, '[versions]\nkotlin = "2.0.0"\n')
+        self.run_tool("scan")
+        remove, _left = self.plan()
+        self.assertEqual(remove, [".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"])
+        self.run_tool("clean")
+        self.catalog(cat, '[versions]\nkotlin = "1.9.0"\n')  # changed after the dry run
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(json.loads(out)["removed"], [])
+        self.assertTrue(self.exists(".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"))
+
+    def test_private_catalog_folder_is_scrubbed(self):
+        self.catalog("Developer/app/gradle/libs.versions.toml", '[versions]\nkotlin = "2.0.0"\n')
+        self.run_tool("scan")
+        self.run_tool("scan")  # previous.json has it too
+        self.run_tool("private", "add", "~/Developer/app/gradle")
+        for name in ("latest.json", "previous.json"):
+            with open(self.tool.state_dir(self.home) + "/" + name) as f:
+                data = json.load(f)
+            self.assertEqual((data["kotlin_pins"], data["kotlin_catalogs"]), ([], []), name)
+
+    def test_parser_resolves_refs_whatever_the_table_order(self):
+        text = ('[plugins]\nkmp = { id = "org.jetbrains.kotlin.multiplatform", '
+                'version.ref = "kgp" }\n[versions]\nkgp = "2.1.20"\n')
+        self.assertEqual(self.tool.kotlin_versions(text), ["2.1.20"])
 
     def test_parser(self):
         text = (

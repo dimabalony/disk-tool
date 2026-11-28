@@ -545,7 +545,7 @@ _QUOTED = r"""\s*=\s*["']([^"']+)["']"""
 def kotlin_versions(text):
     """Kotlin versions a version catalog names: the plugins and libraries with an
     org.jetbrains.kotlin id (version or version.ref), and a [versions] key "kotlin"."""
-    versions, found, section = {}, set(), None
+    versions, found, refs, section = {}, set(), [], None
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -567,14 +567,15 @@ def kotlin_versions(text):
         elif section in ("plugins", "libraries") and _KOTLIN_ID.search(value):
             ref = re.search(r"(?:version\.ref|ref)" + _QUOTED, value)
             direct = re.search(r"version" + _QUOTED, value)
-            if ref and ref.group(1) in versions:
-                found.add(versions[ref.group(1)])
+            if ref:  # resolved once the whole file is read: [versions] may come later
+                refs.append(ref.group(1))
             elif direct:
                 found.add(direct.group(1))
             else:
                 m = re.match(r"""^["']org\.jetbrains\.kotlin:[^:"']+:([^"']+)["']""", value)
                 if m:
                     found.add(m.group(1))
+    found.update(versions[r] for r in refs if r in versions)
     return sorted(v for v in found if re.match(r"^\d+\.\d+", v))
 
 
@@ -594,14 +595,20 @@ def _is_worktree_link(path, st):
 
 
 def _read_version_catalog(path, st):
+    """The Kotlin versions a catalog names ([] for none), or None when it could not be
+    read (a link, too big, not on this Mac, unreadable): then it may name any version."""
     if (not stat.S_ISREG(st.st_mode) or st.st_size > VERSION_CATALOG_MAX
             or getattr(st, "st_flags", 0) & SF_DATALESS):
-        return []
+        return None
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             return kotlin_versions(f.read(VERSION_CATALOG_MAX))
     except OSError:
-        return []
+        return None
+
+
+def catalog_rel(project):
+    return "/".join(x for x in (project, "gradle", VERSION_CATALOG) if x)
 
 # Walked last and one at a time, so a time limit or a row of prompts costs these rather
 # than the rest: 1 = folders macOS usually guards with a privacy prompt, 2 = cloud drives.
@@ -757,9 +764,7 @@ def walker_main(base):
                                     msg["wt"] = 1
                             if (match and de.name == VERSION_CATALOG and rel
                                     and rel[-1] == "gradle" and rel[0] not in NO_READ_TOP):
-                                kv = _read_version_catalog(de.path, st)
-                                if kv:
-                                    msg["kv"] = kv
+                                msg["kv"] = _read_version_catalog(de.path, st)  # None: unread
                             if stat.S_ISDIR(st.st_mode):
                                 kind = 1 if st.st_dev == dev else 2  # 2: another disk
                                 markers = 0
@@ -1006,6 +1011,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
     private_rels = {tuple(p.split("/")) for p in private}
     items, unknown, not_measured, seen, no_answer = {}, {}, [], set(), []
     pins = []  # Kotlin versions projects name in gradle/libs.versions.toml
+    catalogs = []  # every such catalog seen, and whether it could be read
     # Project folders (those holding build output or a .git) and when anything in them
     # last changed: "newest" leaves out .git and the build output, "newest_all" only .git.
     # chains: folder not listed yet -> the project folders it is in.
@@ -1056,6 +1062,8 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
             stats["bytes"] += total
             return {}
         rows, names, subs = msg["e"], None, {}
+        if "kv" in msg:
+            catalogs.append({"project": "/".join(rel[:-1]), "read": msg["kv"] is not None})
         for version in msg.get("kv") or ():
             pins.append({"version": version, "project": "/".join(rel[:-1])})
         if (msg.get("wt") and rel and rel not in items and _project_allowed(rel, owner)
@@ -1219,6 +1227,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
         "kinds": {k: sum(r["bytes"] for r in records if r["kind"] == k) for k in KINDS},
         "not_measured": sorted(not_measured, key=lambda r: r["rel"]),
         "kotlin_pins": sorted(pins, key=lambda r: (r["version"], r["project"])),
+        "kotlin_catalogs": sorted(catalogs, key=lambda r: r["project"]),
         "projects": {"/".join(rel): d for rel, d in sorted(projects.items())},
         "items": records,
     }
@@ -1539,7 +1548,8 @@ def scan_view(result, changes, top):
         }
     blocked = result["not_measured"]
     view = {k: v for k, v in result.items()
-            if k not in ("items", "kinds", "not_measured", "kotlin_pins", "projects")}
+            if k not in ("items", "kinds", "not_measured", "kotlin_pins", "kotlin_catalogs",
+                         "projects")}
     view["outside"] = result.get("outside", {"scanned": False})
     view["kinds"] = kinds
     view["not_measured"] = [{k: v for k, v in r.items() if k != "names"}
@@ -2410,9 +2420,10 @@ def scrub_saved(home, folder):
         if "projects" in data:
             data["projects"] = {rel: d for rel, d in data["projects"].items()
                                 if not _inside(rel, [folder])}
-        if "kotlin_pins" in data:
-            data["kotlin_pins"] = [r for r in data["kotlin_pins"]
-                                   if not _inside(r["project"], [folder])]
+        for key in ("kotlin_pins", "kotlin_catalogs"):
+            if key in data:  # by the project and by the catalog file, which may be private
+                data[key] = [r for r in data[key] if not _inside(r["project"], [folder])
+                             and not _inside(catalog_rel(r["project"]), [folder])]
         _write_json(path, data)
     scrub_change_log(home, folder)
     policy = _read_json(policy_path(home))
@@ -2589,7 +2600,7 @@ def check_path(home, path, container=False):
     return None
 
 
-def _git_proc(repo, *argv):
+def _git_proc(repo, *argv, timeout=60):
     # The repo may sit inside a downloaded cache, so switch off what its own config
     # could make git run, and any network transport. GIT_OPTIONAL_LOCKS=0 keeps
     # `git status` from writing the index.
@@ -2600,7 +2611,7 @@ def _git_proc(repo, *argv):
     try:
         return subprocess.run(["git"] + hardening + ["-C", repo] + list(argv),
                               capture_output=True,
-                              text=True, env=env, timeout=60, stdin=subprocess.DEVNULL)
+                              text=True, env=env, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
 
@@ -2628,15 +2639,83 @@ def _repo_config_runs_programs(repo):
                for line in proc.stdout.splitlines() if line.strip())
 
 
-# Ignored files `git worktree remove` may take with it: folders that rebuild.
-WORKTREE_IGNORED_OK = set(_PROJECT_BY_NAME) | {".DS_Store", "__pycache__"}
+# Ignored files `git worktree remove` may take with it: folders that rebuild (build
+# output only where its marker is, as the scan finds it) and Finder's .DS_Store.
+WORKTREE_IGNORED_DIRS = set(_PROJECT_BY_NAME) | {"__pycache__"}
+WORKTREE_IGNORED_FILES = {".DS_Store"}
+# Names inside those folders that a person may still need: if one is there, it stays.
+WORKTREE_KEEP_NAMES = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks",
+                       "*.keystore", "*.mobileprovision", "*.provisionprofile", "id_rsa*",
+                       "id_ecdsa*", "id_ed25519*", ".netrc", ".npmrc", ".pypirc")
+
+
+def _staged(repo):
+    """Whether anything is staged, submodule pointers included (`git status
+    --ignore-submodules=all` hides those). diff-index --cached compares the index with
+    HEAD only: it never enters a submodule. None when git cannot say."""
+    head = _git(repo, "rev-parse", "--verify", "-q", "HEAD")
+    if head is None:  # no commit yet: anything in the index is staged
+        out = _git(repo, "ls-files", "-z", "--cached")
+    else:
+        out = _git(repo, "diff-index", "--cached", "--name-only", "-z",
+                   "--ignore-submodules=none", "--no-ext-diff", "HEAD")
+    return None if out is None else bool(out.strip("\0"))
+
+
+def _ignored_problem(path, entries):
+    """Why the ignored files of a worktree would be lost with it, or None. entries: the
+    `!!` paths of `git status`. Inconclusive means a reason."""
+    dirs = []
+    for rel in entries:
+        name = os.path.basename(rel.rstrip("/"))
+        full = os.path.join(path, rel.rstrip("/"))
+        try:
+            st = os.lstat(full)
+        except OSError:
+            return f"could not check {rel}, which git ignores"
+        if name in WORKTREE_IGNORED_FILES and stat.S_ISREG(st.st_mode):
+            continue
+        if name in WORKTREE_IGNORED_DIRS and stat.S_ISDIR(st.st_mode):
+            if name in _PROJECT_BY_NAME:
+                try:
+                    siblings = set(os.listdir(os.path.dirname(full)))
+                except OSError:
+                    return f"could not check {rel}, which git ignores"
+                markers = [m for m in _CONTAINS.get(name, ())
+                           if os.path.lexists(os.path.join(full, m))]
+                if match_project(tuple(rel.rstrip("/").split("/")), siblings, markers) is None:
+                    return (f"it holds files git ignores that would be lost, such as {rel} "
+                            "(not build output: its project marker is not next to it)")
+            dirs.append(rel.rstrip("/") + "/")
+            continue
+        return f"it holds files git ignores that would be lost, such as {rel}"
+    if not dirs:
+        return None
+    # Every file in those folders: none may be a key or a local settings file, and none
+    # may be another git checkout.
+    files = _git(path, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+    if files is None:
+        return "git could not list the files it ignores"
+    for f in filter(None, files.split("\0")):
+        if f.endswith("/"):
+            return f"it holds another git project, {f.rstrip('/')}, in a folder git ignores"
+        if os.path.basename(f) in WORKTREE_IGNORED_FILES:
+            continue
+        if not any(f.startswith(d) for d in dirs):
+            return f"it holds files git ignores that would be lost, such as {f}"
+        if any(fnmatch.fnmatchcase(os.path.basename(f), p) for p in WORKTREE_KEEP_NAMES):
+            return (f"it holds {f}, which git ignores and a person may still need; remove "
+                    "it yourself if it is not needed")
+    return None
 
 
 def worktree_check(home, path):
-    """(why this worktree must stay, None) or (None, {"upstream", "commit"}). It may go
-    when it is a linked worktree, nothing in it is uncommitted or untracked, the files
-    git ignores are only rebuildable folders, and its branch has an upstream that holds
-    every commit. Reads only: `git status` runs with GIT_OPTIONAL_LOCKS=0."""
+    """(why this worktree must stay, None) or (None, {"upstream", "commit", "head",
+    "git_dir"}). It may go when it is a linked worktree, not locked, nothing in it is
+    uncommitted, staged or untracked, the files git ignores are only build output, and
+    its branch has an upstream that holds every commit. Reads only: `git status` runs
+    with GIT_OPTIONAL_LOCKS=0. Called when planning and again right before removal."""
+    home = os.path.realpath(home)
     out = _git(path, "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel")
     lines = out.splitlines() if out else []
     if len(lines) < 3:
@@ -2647,32 +2726,42 @@ def worktree_check(home, path):
         return "not a linked git worktree", None
     if os.path.realpath(lines[2]) != os.path.realpath(path):
         return "not the top folder of its git worktree", None
+    # `git worktree remove` deletes the checkout and its folder in the repository
+    # (<repo>/.git/worktrees/<name>): both must be inside home.
+    if (not git_dir.startswith(home + os.sep)
+            or os.path.dirname(git_dir) != os.path.join(common, "worktrees")):
+        return "its repository keeps it outside your home folder", None
     try:  # the repository must name this folder as its worktree, too
         with open(os.path.join(git_dir, "gitdir"), encoding="utf-8", errors="replace") as f:
             back = f.read(4096).strip()
     except OSError:
         back = ""
-    if os.path.realpath(back) != os.path.realpath(os.path.join(path, ".git")):
+    # git --relative-paths writes it relative to the repository's folder for it
+    back = os.path.realpath(os.path.join(git_dir, back)) if back else ""
+    if back != os.path.realpath(os.path.join(path, ".git")):
         return "its repository does not list it as a worktree", None
+    if os.path.lexists(os.path.join(git_dir, "locked")):
+        return "it is locked (`git worktree lock`); git keeps it until it is unlocked", None
     if _repo_config_runs_programs(path):
         return "its repository sets programs for git to run in its own config", None
     if (os.path.lexists(os.path.join(path, ".gitmodules"))
             or os.path.lexists(os.path.join(git_dir, "modules"))):
         return "it has git submodules (git worktree remove refuses those)", None
-    status = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal",
+    status = _git(path, "status", "--porcelain", "-z", "--ignored", "--untracked-files=normal",
                   "--ignore-submodules=all")
-    if status is None:
+    staged = _staged(path)
+    if status is None or staged is None:
         return "git could not check it for changes", None
-    lost = []
-    for line in status.splitlines():
-        if not line.startswith("!! "):
+    ignored = []
+    for entry in filter(None, status.split("\0")):
+        if not entry.startswith("!! "):
             return "it has uncommitted or untracked changes", None
-        name = os.path.basename(line[3:].strip().strip('"').rstrip("/"))
-        if name not in WORKTREE_IGNORED_OK:
-            lost.append(line[3:].strip())
-    if lost:
-        return (f"it holds files git ignores that would be lost, such as {lost[0]}; "
-                "remove it yourself if they are not needed"), None
+        ignored.append(entry[3:])
+    if staged:
+        return "it has staged changes", None
+    problem = _ignored_problem(path, ignored)
+    if problem:
+        return problem, None
     upstream = _git(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
     if not upstream or not upstream.strip():
         return "its branch has no upstream, so nothing shows it is pushed", None
@@ -2682,25 +2771,40 @@ def worktree_check(home, path):
         return "git could not compare it with its upstream", None
     if int(ahead) > 0:
         return f"it has {int(ahead)} commits not pushed to {upstream}", None
-    commit = last_commit(path)
-    if commit is None:
+    commit, head = last_commit(path), _git(path, "rev-parse", "--verify", "-q", "HEAD")
+    if commit is None or not head:
         return "could not read its last commit", None
-    return None, {"upstream": upstream, "commit": commit}
+    return None, {"upstream": upstream, "commit": commit, "head": head.strip(),
+                  "git_dir": git_dir}
 
 
-def remove_worktree(home, path):
-    """`git worktree remove` (never --force): git itself refuses a worktree that is not
-    clean. The branch stays in the repository."""
+def remove_worktree(home, path, planned=None):
+    """`git worktree remove` (never --force), after checking everything again: the
+    worktree checks, files an outer repository tracks, and that its commit and upstream
+    are still those of the dry run (planned: {"upstream", "head"}). Returns (how, why it
+    stays, partly): partly is True when git failed after it may have deleted something."""
     reason = check_path(home, path)
     if reason:
-        return None, reason
-    proc = _git_proc(path, "worktree", "remove", path)
-    if proc is None or proc.returncode != 0:
-        err = (proc.stderr.strip().splitlines() or ["git failed"])[-1] if proc else "git failed"
-        return None, f"git worktree remove refused: {err}"
-    if os.path.lexists(path):
-        return None, "git worktree remove left it in place"
-    return "git worktree remove", None
+        return None, reason, False
+    reason, info = worktree_check(home, path)
+    if reason is None and planned and any(info[k] != planned.get(k) for k in planned):
+        reason = "its commit or upstream changed since the dry run"
+    reason = reason or git_check(home, path, [])
+    if reason:
+        return None, reason, False
+    # a long limit: stopping git while it deletes would leave half a worktree
+    proc = _git_proc(path, "worktree", "remove", path, timeout=3600)
+    if proc is not None and proc.returncode == 0 and not os.path.lexists(path):
+        return "git worktree remove", None, False
+    err = " ".join(line.strip() for line in (proc.stderr if proc else "").splitlines()
+                   if line.strip()) or "git failed"
+    if proc is not None and proc.returncode == 0:
+        return None, "git worktree remove left it in place", True
+    partly = (not os.path.lexists(path) or not os.path.lexists(os.path.join(path, ".git"))
+              or not os.path.lexists(info["git_dir"]) or "failed to delete" in err)
+    if partly:
+        return None, f"git worktree remove failed part way: {err}", True
+    return None, f"git worktree remove refused: {err}", False
 
 
 def git_check(home, path, git_dirs):
@@ -2712,9 +2816,10 @@ def git_check(home, path, git_dirs):
         # Submodules are not entered here: each is a .git of its own in the walk, and
         # gets this same check, config gate first.
         status = _git(repo, "status", "--porcelain", "--ignore-submodules=all")
-        if status is None:
+        staged = _staged(repo)  # a staged submodule pointer, which that hides
+        if status is None or staged is None:
             return f"git project {name} could not be checked"
-        if status.strip():
+        if status.strip() or staged:
             return f"git project {name} has uncommitted changes"
         unpushed = _git(repo, "log", "--branches", "--not", "--remotes", "--oneline", "-n", "1")
         if unpushed is None or unpushed.strip():
@@ -2758,10 +2863,55 @@ def last_commit(repo):
         return None
 
 
-def project_idle(home, scan, rel, now, commits):
+def project_activity(home, rel, time_limit, stall_limit, private):
+    """When anything in a project folder last changed outside .git and build output,
+    read again now by the child walker (the same rule the scan uses): an epoch, or None
+    when the walk could not see all of it."""
+    root = tuple(rel.split("/"))
+    state = {"newest": 0.0, "ok": True}
+
+    def on_listing(r, ctx, msg):
+        if ctx is None:
+            return {}  # inside .git or build output
+        if "err" in msg:
+            if r == root or msg["err"] != "gone":  # a subfolder gone meanwhile is fine
+                state["ok"] = False
+            return {}
+        if "p" in msg:  # a private folder: what changed in it is not known
+            state["ok"] = False
+            return {}
+        rows = msg.get("e") or ()
+        names, subs = {row[0] for row in rows}, {}
+        for name, kind, _size, newest, _link, markers in rows:
+            if name == ".git" or kind == 2:
+                continue
+            crel = r + (name,)
+            entry = match_path(crel)
+            if entry is None and kind == 1:
+                entry = match_project(crel, names, markers or ())
+            if entry is not None and entry.id in _PROJECT_IDS:
+                continue
+            state["newest"] = max(state["newest"], newest)
+            if kind == 1:
+                subs[name] = True
+        if "f" in msg:
+            state["newest"] = max(state["newest"], msg["f"][1])
+        return subs
+
+    def failed(*_args):
+        state["ok"] = False
+
+    cut, _pending = walk(home, {root: True}, on_listing, time_limit, stall_limit,
+                         skip_slow=False, on_no_answer=failed, on_skipped=failed,
+                         private={tuple(f.split("/")) for f in private})
+    return state["newest"] if state["ok"] and not cut else None
+
+
+def project_idle(home, scan, rel, now, commits, activity=None):
     """(days its project has been idle, None) or (None, why that is not known). The
     project is the nearest git checkout around the item, else the folder holding it.
-    Idle: no file in it changed outside .git and build output, and no commit was made."""
+    Idle: no file in it changed outside .git and build output, and no commit was made.
+    activity: a function that reads a project's last change again (for --apply)."""
     projects = scan.get("projects")
     if projects is None:
         return None, (f"the last scan is from an older version of {NAME}, which did not "
@@ -2777,6 +2927,12 @@ def project_idle(home, scan, rel, now, commits):
         return None, (f"the last scan could not see all of its project {disp(found)}, so "
                       "it cannot tell when it was last used")
     newest = p["newest"]
+    if activity is not None:
+        again = activity(found)
+        if again is None:
+            return None, (f"could not check again whether its project {disp(found)} was "
+                          "used since the scan")
+        newest = max(newest, again)
     if p.get("git"):
         if found not in commits:
             commits[found] = last_commit(os.path.join(home, *found.split("/")))
@@ -2786,9 +2942,11 @@ def project_idle(home, scan, rel, now, commits):
     return days_since(newest, now), found
 
 
-def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
+def build_plan(home, scan, policy, only, time_limit, stall_limit=None, fresh=False):
     """Rows of what `clean` would remove (remove=True) and what it leaves, with reasons.
-    A container's row becomes one row per unit (see `units` in the catalog)."""
+    A container's row becomes one row per unit (see `units` in the catalog).
+    fresh (for --apply): read again what the scan recorded and a removal depends on,
+    the Kotlin pins and when projects were last used; what cannot be read stays."""
     now = _now()
     stall_limit = STALL_LIMIT if stall_limit is None else stall_limit
     private = sorted(set(load_private(home)) | set(scan.get("private", [])))
@@ -2870,7 +3028,19 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                   for row in to_measure if ENTRIES[row["id"]].units}
     measured = measure_many(home, [tuple(r["rel"].split("/")) for r in to_measure],
                             time_limit, stall_limit, units=containers)
-    unit_rows, commits = {}, {}
+    unit_rows, commits, pins, again = {}, {}, [], {}
+
+    def activity(found):
+        if found not in again:
+            again[found] = project_activity(home, found, time_limit, stall_limit, private)
+        return again[found]
+
+    def pinned():
+        if not pins:
+            again = (read_catalogs_again(home, scan, private, time_limit, stall_limit)
+                     if fresh else None)
+            pins.append(pin_check(scan, again))
+        return pins[0]
     for row in to_measure:
         key = tuple(row["rel"].split("/"))
         m = measured[key]
@@ -2883,7 +3053,7 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                 reason = "another disk is mounted inside it"
             else:
                 unit_rows[row["rel"]] = _unit_rows(home, row, r, m["units"], only, now,
-                                                   blocking, recent, pin_check(scan))
+                                                   blocking, recent, pinned(), policy)
                 reason = "a container: its parts are judged one by one"
         elif reason is None:
             row["bytes"] = m["bytes"]
@@ -2897,6 +3067,7 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                 if reason is None:
                     row["days_unchanged"] = days_since(max(m["newest"], info["commit"]), now)
                     row["upstream"], row["removed_with"] = info["upstream"], "git worktree remove"
+                    row["head"] = info["head"]
                     if not only and row["days_unchanged"] < r["older_than_days"]:
                         reason = (f"in use {row['days_unchanged']} days ago (its last commit "
                                   "or a file in it)")
@@ -2907,7 +3078,8 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
             elif not only and row["days_unchanged"] < r["older_than_days"]:
                 reason = f"changed {row['days_unchanged']} days ago"
             elif not only and row["id"] in _PROJECT_IDS:
-                idle, where = project_idle(home, scan, row["rel"], now, commits)
+                idle, where = project_idle(home, scan, row["rel"], now, commits,
+                                           activity if fresh else None)
                 if idle is None:
                     reason = where
                 elif idle < r["older_than_days"]:
@@ -2933,12 +3105,55 @@ KONAN_COMPILER = re.compile(r"^kotlin-native(?:-prebuilt)?-(?:macos|linux|window
                             r"(?:-(?:aarch64|arm64|x86_64|x64))?-(\d[\w.+-]*)$")
 
 
-def pin_check(scan):
+def read_catalogs_again(home, scan, private, time_limit, stall_limit):
+    """For `clean --apply`: each version catalog the last scan found, read again now by
+    the child walker. {project: versions, or None when it could not be read}."""
+    roots = {}
+    for c in scan.get("kotlin_catalogs") or ():
+        if not _inside(catalog_rel(c["project"]), private):
+            gradle = tuple(x for x in c["project"].split("/") if x) + ("gradle",)
+            roots[gradle] = c["project"]
+    res = {project: None for project in roots.values()}
+    if not roots:
+        return res
+
+    def on_listing(rel, project, msg):
+        if project is None or rel not in roots:
+            return {}  # a folder inside gradle/: not needed
+        if "err" in msg:
+            res[project] = [] if msg["err"] == "gone" else None  # gone: names nothing
+        elif "p" in msg:
+            res[project] = None
+        else:
+            res[project] = msg["kv"] if "kv" in msg else []  # no catalog now: names nothing
+        return {}
+
+    def failed(rel, project, *_args):
+        if project is not None and rel in roots:
+            res[project] = None
+
+    walk(home, {r: p for r, p in roots.items()}, on_listing, time_limit, stall_limit,
+         skip_slow=False, match=True, first_lim=0, on_no_answer=failed,
+         on_skipped=lambda _parent, rows, _why: [failed(r, p) for r, p in rows],
+         private={tuple(f.split("/")) for f in private})
+    return res
+
+
+def pin_check(scan, fresh=None):
     """A test for one unit of a container: why a project still needs it, or None. Today
-    only Kotlin/Native compilers (~/.konan) that a version catalog names."""
-    pins = {}
+    only Kotlin/Native compilers (~/.konan) that a version catalog names. fresh: the
+    catalogs read again just now (see read_catalogs_again); their pins count too."""
+    pins, unread = {}, []
     for p in scan.get("kotlin_pins") or ():
         pins.setdefault(p["version"], p["project"])
+    for c in scan.get("kotlin_catalogs") or ():
+        if not c.get("read"):
+            unread.append(c["project"])
+    for project, versions in sorted((fresh or {}).items()):
+        if versions is None:
+            unread.append(project)
+        for version in versions or ():
+            pins.setdefault(version, project)
 
     def test(entry_id, key):
         if entry_id != "konan":
@@ -2947,12 +3162,14 @@ def pin_check(scan):
         if not m:
             return None
         version = m.group(1)
-        if "kotlin_pins" not in scan:
+        if "kotlin_pins" not in scan or "kotlin_catalogs" not in scan:
             return (f"Kotlin {version}: the last scan is from an older version of {NAME}, "
                     "which did not look for projects that use it; scan again")
         if version in pins:
-            where = disp("/".join(x for x in (pins[version], "gradle", VERSION_CATALOG) if x))
-            return f"Kotlin {version} is named in {where}"
+            return f"Kotlin {version} is named in {disp(catalog_rel(pins[version]))}"
+        if unread:
+            return (f"Kotlin {version}: could not read {disp(catalog_rel(unread[0]))}, so "
+                    "it may name this version")
         if not scan.get("complete"):
             return (f"Kotlin {version}: the last scan did not see every folder, so a "
                     "project that uses it may have been missed")
@@ -2960,21 +3177,31 @@ def pin_check(scan):
     return test
 
 
-def _unit_rows(home, row, rule, units, only, now, blocking, recent, pinned):
-    """One row per unit of a container. Units that changed recently are only counted."""
+def _unit_rows(home, row, rule, units, only, now, blocking, recent, pinned, policy):
+    """One row per unit of a container. Units that changed recently are only counted.
+    A unit's own path rule, when the policy has one, beats the container's."""
     out = []
     for key in sorted(units, key=lambda k: -units[k]["bytes"]):
         m = units[key]
         rel = "/".join(key)
+        own = (policy.get("paths") or {}).get(rel)
+        r = dict(own) if own else rule
         unit = dict(row, rel=rel, path=os.path.join(home, *key), bytes=m["bytes"],
                     days_unchanged=days_since(m["newest"], now), part_of=row["rel"])
+        if own:
+            unit["rule"] = _rule_text(r)
         reason = _measure_reason(m) or check_path(home, unit["path"])
+        if reason is None and r["action"] == "keep":
+            reason = "your policy says keep"
+        elif reason is None and r["action"] != "clean" and not only:
+            reason = f"your policy says {r['action']}"
         if reason is None:
             if m["unreadable"]:
                 reason = "could not look inside all of it"
             elif m["mount"]:
                 reason = "another disk is mounted inside it"
-            elif not only and unit["days_unchanged"] < rule["older_than_days"]:
+            elif not only and unit["days_unchanged"] < r.get("older_than_days",
+                                                             rule["older_than_days"]):
                 recent["count"] += 1
                 recent["bytes"] += m["bytes"]
                 continue
@@ -3059,7 +3286,8 @@ def cmd_clean(args, home):
     only = [p[2:] if p.startswith("~/") else os.path.relpath(p, home) if os.path.isabs(p)
             else p for p in (args.path or [])]
     only = [p.rstrip("/") for p in only]
-    rows, recent = build_plan(home, scan, policy, only, args.time_limit, args.stall_limit)
+    rows, recent = build_plan(home, scan, policy, only, args.time_limit, args.stall_limit,
+                              fresh=args.apply)
     plan_file = _plan_file(home)
     if not args.apply:
         _write_json(plan_file, {"home": home, "created_epoch": _now(),
@@ -3073,7 +3301,7 @@ def cmd_clean(args, home):
         return 1
     shown = set(saved.get("remove", []))
     free_before = shutil.disk_usage(home).free
-    done, skipped = [], []
+    done, skipped, partly = [], [], []
     for row in rows:
         if not row["remove"]:
             continue
@@ -3081,8 +3309,11 @@ def cmd_clean(args, home):
             row["reason"] = "was not in the dry run you checked"
             skipped.append(row)
             continue
+        part = False
         if row["id"] == WORKTREE.id:
-            how, reason = remove_worktree(home, row["path"])
+            how, reason, part = remove_worktree(home, row["path"],
+                                                {"upstream": row["upstream"],
+                                                 "head": row["head"]})
         else:
             how, reason = remove_item(home, row["path"], row["rel"])
         if how:
@@ -3090,13 +3321,13 @@ def cmd_clean(args, home):
             done.append(row)
         else:
             row["reason"] = reason
-            skipped.append(row)
+            (partly if part else skipped).append(row)
     os.unlink(plan_file)
     free_after = shutil.disk_usage(home).free
     in_trash = sum(r["bytes"] for r in done if r["done"] == "moved to the Trash")
     if args.json:
         print(json.dumps({"applied": True, "removed": done, "skipped": skipped,
-                          "free_before": free_before, "free_after": free_after,
+                          "partly_removed": partly, "free_before": free_before, "free_after": free_after,
                           "moved_to_trash_bytes": in_trash}, indent=2, ensure_ascii=False))
         return 0
     if done:
@@ -3108,6 +3339,10 @@ def cmd_clean(args, home):
     if skipped:
         print("Skipped:")
         for r in skipped:
+            print(f"  {disp(r['rel'])}: {r['reason']}")
+    if partly:
+        print("Partly removed (look at these yourself; git may have deleted some of it):")
+        for r in partly:
             print(f"  {disp(r['rel'])}: {r['reason']}")
     print(f"Free space: {fmt_bytes(free_before)} -> {fmt_bytes(free_after)} "
           f"({fmt_bytes(free_after - free_before, sign=True)}).")
@@ -3158,7 +3393,9 @@ def _report_plan(args, scan, rows, recent):
               f"({fmt_bytes(recent['bytes'])}) have a clean rule but changed recently; "
               "they stay.")
     if keep:
-        extra = "".join(" --path " + shlex.quote(r["rel"]) for r in keep) if args.path else ""
+        # the selectors as given: a container's parts are not items `--path` takes, and
+        # --apply removes only what this list shows anyway
+        extra = "".join(" --path " + shlex.quote(p) for p in args.path or ())
         print()
         print(f"To remove exactly the {len(keep)} above: {NAME} clean{extra} --apply")
         print("Items go to the Trash (items already in the Trash are deleted).")
@@ -3200,13 +3437,17 @@ What it does
            Some caches are cleaned part by part (Xcode DerivedData, ~/.konan, JetBrains,
            Swift packages, Gradle versions): each version or project folder inside goes
            when nothing in it changed for the rule's days; the rest stays. A Kotlin/Native
-           version a project's gradle/libs.versions.toml names is kept.
+           version a project's gradle/libs.versions.toml names is kept (every version,
+           while a catalog cannot be read).
            Build output (node_modules, .venv, build ...) goes only when its project is
            idle too: no commit and no change to its own files for that long.
            A git worktree (from `git worktree add`) is offered only when the policy
            names it (`{name} policy set git-worktree clean`, 60 days unless you say),
-           and only when everything in it is committed and pushed and it holds no
-           ignored files beyond build output; `git worktree remove` removes it.
+           and only when it is not locked, everything in it is committed and pushed and
+           it holds no ignored files beyond build output (no .env or key file, inside
+           build output either); `git worktree remove` removes it.
+           `clean --path <item>` is your own pick: no wait for the days and no clean
+           rule needed (a worktree too); a keep rule and the git checks still hold.
   private  Folders whose contents must never be named, such as an employer's code or
            client work: `{name} private add ~/Developer/Acme`. For each one the
            report shows only its path and total size. Nothing inside it is listed,
@@ -3221,9 +3462,10 @@ What it does
            grows past the limit still alerts; keep means "never clean", not "never look".
 
 What it never does
-  - It never opens or reads your files: it looks at sizes and dates only. The one
-    exception: a project's gradle/libs.versions.toml (for its Kotlin version) and a
-    git worktree's .git pointer file.
+  - It never opens or reads your files: it looks at sizes and dates only. The
+    exceptions: a project's gradle/libs.versions.toml (for its Kotlin version), a git
+    worktree's .git pointer file and the gitdir file its repository keeps for it, and
+    what git itself reads when `clean` checks a git project.
   - It never uses the network and sends nothing anywhere.
   - It never removes your own files (user) or anything it does not recognise (unknown).
   - It never opens another account's folder, and never removes anything outside your
@@ -3243,8 +3485,10 @@ Where it keeps its files
 How cleaning works
   1. `{name} clean` shows the list and the space it frees.
   2. `{name} clean --apply` removes only that list, checking each item again first and
-     skipping anything that changed. Items go to the Trash when possible: empty the
-     Trash to get the space back. Items already in the Trash are deleted.
+     skipping anything that changed (also a project used since, a Kotlin version a
+     catalog names now, a worktree's git state); what it cannot check again stays.
+     Items go to the Trash when possible: empty the Trash to get the space back. Items
+     already in the Trash are deleted.
 
 Privacy prompts and time limits
   macOS may ask whether your terminal may access Documents, Desktop or other apps' data.

@@ -104,6 +104,53 @@ class IdleProjectTest(HomeTestCase):
         self.assertIn("its project ~/Developer/mono was in use",
                       left["Developer/mono/packages/web/node_modules"])
 
+    def test_apply_reads_project_use_again(self):
+        self.project("idle")
+        self.project("plain", use_git=False)
+        remove, _left = self.plan()
+        self.assertEqual(sorted(remove), ["Developer/idle/node_modules",
+                                          "Developer/plain/node_modules"])
+        self.touch_future("Developer/idle/src/index.js", 39)  # edited after the dry run
+        self.touch_future("Developer/plain/src", 39)
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(json.loads(out)["removed"], [])
+        for name in ("idle", "plain"):
+            self.assertTrue(os.path.isdir(os.path.join(self.home, "Developer", name,
+                                                       "node_modules")))
+
+    def test_apply_leaves_output_when_use_cannot_be_read_again(self):
+        self.project("plain", use_git=False)
+        remove, _left = self.plan()
+        self.assertEqual(remove, ["Developer/plain/node_modules"])
+        self.tool.project_activity = lambda *_args: None
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(json.loads(out)["removed"], [])
+        self.assertTrue(os.path.isdir(os.path.join(self.home, "Developer/plain/node_modules")))
+
+    def test_apply_still_removes_an_unchanged_idle_project(self):
+        self.project("plain", use_git=False)
+        remove, _left = self.plan()
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual([r["rel"] for r in json.loads(out)["removed"]], remove)
+
+    def test_staged_submodule_pointer_in_build_output_keeps_it(self):
+        root = self.project("staged")
+        remote = os.path.join(self.outside, "staged.git")
+        git(self.outside, "init", "-q", "--bare", remote)
+        nm = os.path.join(root, "node_modules", "dep")
+        git(nm, "init", "-q")
+        git(nm, "add", ".")
+        git(nm, "commit", "-q", "-m", "dep")
+        git(nm, "remote", "add", "origin", remote)
+        git(nm, "push", "-q", "-u", "origin", "HEAD:main")
+        git(nm, "fetch", "-q", "origin")
+        head = subprocess.run(["git", "-C", nm, "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+        git(nm, "update-index", "--add", "--cacheinfo", f"160000,{head},vendored")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("has uncommitted changes", left["Developer/staged/node_modules"])
+
     def test_an_old_scan_without_project_data_cleans_no_build_output(self):
         self.project("idle")
         self.run_tool("scan")

@@ -34,6 +34,16 @@ class WorktreeTest(HomeTestCase):
             git(path, "push", "-q", "-u", "origin", name)
         return path
 
+    def commit_file(self, name, rel, text=None):
+        path = os.path.join(self.home, "Developer", name)
+        self.write(f"Developer/{name}/{rel}", 10)
+        if text is not None:
+            with open(os.path.join(path, rel), "w") as f:
+                f.write(text)
+        git(path, "add", rel)
+        git(path, "commit", "-q", "-m", "add " + rel)
+        git(path, "push", "-q")
+
     def plan(self, *argv):
         self.run_tool("scan")
         rc, out = self.run_tool("clean", "--json", *argv)
@@ -45,6 +55,7 @@ class WorktreeTest(HomeTestCase):
     def test_only_a_clean_pushed_old_worktree_is_a_candidate(self):
         self.run_tool("policy", "set", "git-worktree", "clean")  # 60 days by default
         done = self.worktree("done")
+        self.commit_file("done", "package.json")
         self.write("Developer/done/node_modules/dep/index.js", 10)  # ignored, rebuilds
         dirty = self.worktree("dirty")
         with open(os.path.join(dirty, "README"), "w") as f:
@@ -94,7 +105,7 @@ class WorktreeTest(HomeTestCase):
         self.assertEqual(applied["removed"][0]["done"], "git worktree remove")
         self.assertFalse(os.path.exists(done))
         listed = subprocess.run(["git", "-C", self.app, "worktree", "list"],
-                                capture_output=True, text=True).stdout
+                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn(done, listed)
         branches = subprocess.run(["git", "-C", self.app, "branch", "--list", "done"],
                                   capture_output=True, text=True).stdout
@@ -216,6 +227,125 @@ class WorktreeTest(HomeTestCase):
         with open(self.tool.state_dir(self.home) + "/latest.json") as f:
             ids = {r["rel"]: r["id"] for r in json.load(f)["items"]}
         self.assertNotEqual(ids.get("Developer/app/lib"), "git-worktree")
+
+    def test_ignored_build_names_must_be_real_build_output_without_keys(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        for name in ("ok", "bare", "file", "envin", "nested"):
+            self.worktree(name)
+            self.commit_file(name, ".gitignore", "node_modules/\nbuild\n.env\n")
+        for name in ("ok", "envin", "nested"):
+            self.commit_file(name, "build.gradle")
+        self.write("Developer/ok/build/classes/A.class", 10)
+        self.write("Developer/bare/node_modules/dep/index.js", 10)  # no package.json
+        self.write("Developer/file/build", 10)  # a file named build, not a folder
+        self.write("Developer/envin/build/.env", 10)
+        nested = self.mkdir("Developer/nested/build/tool")
+        git(nested, "init", "-q")
+        self.write("Developer/nested/build/tool/x", 10)
+        remove, left = self.plan()
+        self.assertEqual(remove, ["Developer/ok"])
+        self.assertIn("not build output", left["Developer/bare"])
+        self.assertIn("would be lost, such as build", left["Developer/file"])
+        self.assertIn("build/.env", left["Developer/envin"])
+        self.assertIn("another git project", left["Developer/nested"])
+
+    def test_a_locked_worktree_stays(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        git(self.app, "worktree", "lock", done)
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("locked", left["Developer/done"])
+
+    def test_removal_checks_everything_again_right_before_git(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        self.commit_file("done", "package.json")
+        self.write("Developer/done/node_modules/dep/index.js", 10)
+        _remove, _left = self.plan()
+        rc, out = self.run_tool("clean", "--json")
+        row = json.loads(out)["remove"][0]
+        planned = {"upstream": row["upstream"], "head": row["head"]}
+        # what changed after the plan was made: each one alone keeps the worktree
+        self.write("Developer/done/node_modules/dep/.env", 10)
+        how, why, partly = self.tool.remove_worktree(self.home, done, planned)
+        self.assertEqual((how, partly), (None, False))
+        self.assertIn("node_modules/dep/.env", why)
+        os.unlink(os.path.join(done, "node_modules/dep/.env"))
+        git(self.app, "worktree", "lock", done)
+        how, why, _partly = self.tool.remove_worktree(self.home, done, planned)
+        self.assertIn("locked", why)
+        git(self.app, "worktree", "unlock", done)
+        how, why, _partly = self.tool.remove_worktree(self.home, done,
+                                                      dict(planned, head="0" * 40))
+        self.assertIn("changed since the dry run", why)
+        self.assertTrue(os.path.isdir(done))
+        how, why, _partly = self.tool.remove_worktree(self.home, done, planned)
+        self.assertEqual(how, "git worktree remove", why)
+        self.assertFalse(os.path.exists(done))
+
+    def test_a_failed_removal_says_it_may_be_partial(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        self.commit_file("done", "package.json")
+        self.write("Developer/done/node_modules/dep/index.js", 10)
+        remove, _left = self.plan()
+        self.assertEqual(remove, ["Developer/done"])
+        os.chmod(os.path.join(done, "node_modules", "dep"), 0o500)  # git cannot empty it
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(rc, 0, out)
+        applied = json.loads(out)
+        self.assertEqual(applied["removed"], [])
+        self.assertEqual([r["rel"] for r in applied["partly_removed"]], ["Developer/done"])
+        self.assertIn("failed part way", applied["partly_removed"][0]["reason"])
+
+    def test_staged_submodule_pointer_is_a_change(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        head = subprocess.run(["git", "-C", done, "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+        git(done, "update-index", "--add", "--cacheinfo", f"160000,{head},lib")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("staged changes", left["Developer/done"])
+
+    def test_a_repository_outside_home_keeps_its_worktrees(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        repo = os.path.join(self.outside, "elsewhere")
+        os.makedirs(repo)
+        with open(os.path.join(repo, "README"), "w") as f:
+            f.write("x")
+        git(repo, "init", "-q")
+        git(repo, "add", ".")
+        git(repo, "commit", "-q", "-m", "first")
+        git(repo, "remote", "add", "origin", self.remote)
+        git(repo, "push", "-q", "origin", "main:other")
+        path = os.path.join(self.home, "Developer", "far")
+        git(repo, "worktree", "add", "-q", "-b", "far", path)
+        git(path, "push", "-q", "-u", "origin", "far")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("outside your home folder", left["Developer/far"])
+        self.assertTrue(os.path.isdir(path))
+
+    def test_relative_paths_worktree(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        path = os.path.join(self.home, "Developer", "rel")
+        added = subprocess.run(["git", "-C", self.app, "worktree", "add", "-q",
+                                "--relative-paths", "-b", "rel", path],
+                               capture_output=True, text=True)
+        if added.returncode != 0 and "relative-paths" in added.stderr:
+            self.skipTest("git has no --relative-paths")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        git(path, "push", "-q", "-u", "origin", "rel")
+        with open(os.path.join(self.app, ".git", "worktrees", "rel", "gitdir")) as f:
+            self.assertFalse(os.path.isabs(f.read().strip()))
+        self.assertNotEqual(os.getcwd(), path)
+        remove, left = self.plan()
+        self.assertEqual(remove, ["Developer/rel"], left)
+        rc, out = self.run_tool("clean", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(path))
 
 
 if __name__ == "__main__":

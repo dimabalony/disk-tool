@@ -43,16 +43,23 @@ now. Later, ask *"what's on my disk?"* and it leads with what changed since last
      (per Kotlin/Native version and dependency), JetBrains caches (per IDE version),
      Swift Package Manager (per package) and Gradle versions. Each part goes when nothing
      in it changed for N days; the rest stays. A Kotlin/Native version that a project's
-     `gradle/libs.versions.toml` names is kept.
+     `gradle/libs.versions.toml` names is kept, and so is every version while a catalog
+     cannot be read.
    - Build output and dependencies (`node_modules`, `.venv`, `build` and the like) go
      only when their project is idle too: no commit and no change to the project's own
-     files for N days. A `git status` is not use.
+     files for N days. A `git status` is not use. `--apply` looks at the project again
+     and leaves the output if it was used since, or if it cannot tell.
    - A git worktree made with `git worktree add` is *ask* until you name it
      (`policy set git-worktree clean`, 60 days unless you give `--older-than-days`).
-     Then it is offered only when nothing in it is uncommitted or untracked, it holds no
-     ignored files beyond build output (a `.env` keeps it), its branch has an upstream
-     with every commit, and no commit or file changed for N days. It is removed with
-     `git worktree remove`, not moved to the Trash; the branch stays.
+     Then it is offered only when it is not locked, nothing in it is uncommitted, staged
+     or untracked, it holds no ignored files beyond build output (a `.env` or a key file
+     keeps it, inside build output too), its branch has an upstream with every commit,
+     and no commit or file changed for N days. Its repository must be inside your home
+     folder. `--apply` checks all of this again right before it runs `git worktree
+     remove`, which removes it instead of moving it to the Trash; the branch stays.
+   - `clean --path <item>` is your own pick: it skips the *unused for N days* wait and
+     works on an *ask* item, so a worktree needs no `git-worktree` rule then. A *keep*
+     rule still holds, and so do every git check above.
 
 Folders macOS keeps private (Mail, Messages, some app data) show as *not measured*, never as
 empty. macOS may ask whether your terminal may open some of them; answer or ignore it. A
@@ -108,7 +115,9 @@ them and `private remove` undoes one. They live in `~/.config/disk-tool/private.
 ## What it never does
 
 - Open or read your files. It looks at sizes and dates only, except a project's
-  `gradle/libs.versions.toml` (for the Kotlin version) and a git worktree's `.git` file.
+  `gradle/libs.versions.toml` (for the Kotlin version), a git worktree's `.git` file
+  and the `gitdir` file its repository keeps for it, and what `git` itself reads when
+  `clean` checks a git project.
 - Use the network or send anything anywhere. No telemetry.
 - Remove your own files (*user*) or anything it does not recognise (*unknown*).
 - Look inside another account's folder, or remove anything outside your home folder.

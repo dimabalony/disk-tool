@@ -7,7 +7,8 @@ description: Walks the user through what fills their Mac's disk and cleans what 
 
 The tool is one script: `~/.local/share/disk-tool/bin/disk-tool` (below: `disk-tool`).
 It measures sizes only, never reads file contents (except a project's
-`gradle/libs.versions.toml` and a worktree's `.git` file), never uses the network, and
+`gradle/libs.versions.toml`, a worktree's `.git` file and the `gitdir` file its
+repository keeps for it, and what `git` reads during clean's checks), never uses the network, and
 removes nothing without `clean --apply`. You never remove files yourself: no `rm`, no Finder, no
 other cleaners. Everything goes through the tool.
 
@@ -85,9 +86,10 @@ refuses clean). A private folder shows as its path and total only; never look in
    `~/.konan`, JetBrains, Swift packages, Gradle versions): the list names each part,
    and the parts in use stay. Build output goes only when its project is idle too.
    Git worktrees are `ask` until the user names them: `disk-tool policy set
-   git-worktree clean` (60 days by default) or one worktree by its path. A listed
-   worktree is removed with `git worktree remove`, not moved to the Trash: say so. Never
-   remove a worktree yourself.
+   git-worktree clean` (60 days by default) or one worktree by its path. `clean --path`
+   skips that rule and the days (a keep rule and the git checks still hold): use it only
+   for a worktree the user named. A listed worktree is removed with `git worktree
+   remove`, not moved to the Trash: say so. Never remove a worktree yourself.
 6. Run `disk-tool clean --apply` only after the user says yes to that list. A yes earlier in
    the conversation, or to a different list, does not count. Then report what was freed and
    that items in the Trash free their space when the Trash is emptied.

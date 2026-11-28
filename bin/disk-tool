@@ -2595,7 +2595,8 @@ def _git_proc(repo, *argv):
     # `git status` from writing the index.
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
     hardening = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                 "-c", "core.untrackedCache=false", "-c", "protocol.allow=never"]
+                 "-c", "core.untrackedCache=false", "-c", "protocol.allow=never",
+                 "-c", "log.showSignature=false"]
     try:
         return subprocess.run(["git"] + hardening + ["-C", repo] + list(argv),
                               capture_output=True,
@@ -2607,6 +2608,24 @@ def _git_proc(repo, *argv):
 def _git(repo, *argv):
     proc = _git_proc(repo, *argv)
     return proc.stdout if proc is not None and proc.returncode == 0 else None
+
+
+# Settings in a repository's own config that make git run a program while it reads the
+# working tree (`git status` runs clean filters). A repository found inside a download
+# could set them, so such a repository is not checked and not removed.
+_RUNS_PROGRAMS = (r"^(filter\..*\.(clean|smudge|process)|diff\..*\.(textconv|command)"
+                  r"|core\.fsmonitor)$")
+
+
+def _repo_config_runs_programs(repo):
+    """True when the repository's own config could make git run a program, or when git
+    cannot say. The user's global and system config are theirs, and "command" is this
+    tool's own -c settings, so they count as safe."""
+    proc = _git_proc(repo, "config", "--show-scope", "--get-regexp", _RUNS_PROGRAMS)
+    if proc is None or proc.returncode not in (0, 1):  # 1: no such setting
+        return True
+    return any(line.split(None, 1)[0] not in ("global", "system", "command")
+               for line in proc.stdout.splitlines() if line.strip())
 
 
 # Ignored files `git worktree remove` may take with it: folders that rebuild.
@@ -2628,6 +2647,15 @@ def worktree_check(home, path):
         return "not a linked git worktree", None
     if os.path.realpath(lines[2]) != os.path.realpath(path):
         return "not the top folder of its git worktree", None
+    try:  # the repository must name this folder as its worktree, too
+        with open(os.path.join(git_dir, "gitdir"), encoding="utf-8", errors="replace") as f:
+            back = f.read(4096).strip()
+    except OSError:
+        back = ""
+    if os.path.realpath(back) != os.path.realpath(os.path.join(path, ".git")):
+        return "its repository does not list it as a worktree", None
+    if _repo_config_runs_programs(path):
+        return "its repository sets programs for git to run in its own config", None
     status = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal")
     if status is None:
         return "git could not check it for changes", None
@@ -2675,6 +2703,8 @@ def git_check(home, path, git_dirs):
     """Refuse git projects with unsaved work inside the item, and files git tracks."""
     for repo in git_dirs:
         name = disp(os.path.relpath(repo, home))
+        if _repo_config_runs_programs(repo):
+            return f"git project {name} sets programs for git to run in its own config"
         status = _git(repo, "status", "--porcelain")
         if status is None:
             return f"git project {name} could not be checked"

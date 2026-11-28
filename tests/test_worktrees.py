@@ -152,6 +152,32 @@ class WorktreeTest(HomeTestCase):
         self.assertNotIn("Skipped", out)
         self.assertFalse(os.path.exists(os.path.join(self.home, "Developer/done")))
 
+    def test_a_repository_whose_config_runs_programs_is_not_checked(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        marker = os.path.join(self.outside, "ran")
+        git(self.app, "config", "filter.x.clean", f"touch {marker}; cat")
+        with open(os.path.join(done, ".gitattributes"), "w") as f:
+            f.write("* filter=x\n")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("sets programs for git to run", left["Developer/done"])
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_forged_pointer_is_not_a_worktree(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        fake = os.path.join(self.home, "Developer", "fake")
+        os.makedirs(fake)
+        with open(os.path.join(done, ".git")) as f:
+            pointer = f.read()
+        with open(os.path.join(fake, ".git"), "w") as f:
+            f.write(pointer)  # names done's admin folder, which names done, not fake
+        remove, left = self.plan("--path", "Developer/fake")
+        self.assertEqual(remove, [])
+        self.assertIn("does not list it as a worktree", left["Developer/fake"])
+        self.assertTrue(os.path.isdir(fake))
+
     def test_a_submodule_is_not_a_worktree(self):
         sub = os.path.join(self.outside, "lib.git")
         git(self.outside, "init", "-q", "--bare", sub)

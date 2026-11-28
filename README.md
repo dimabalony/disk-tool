@@ -38,6 +38,22 @@ now. Later, ask *"what's on my disk?"* and it leads with what changed since last
 3. **Clean.** First a dry run: the exact list and how much it frees. Only after your yes to
    that list does it remove them, moving them to the Trash where it can.
 
+   What *unused for N days* means:
+   - Some caches are cleaned part by part: Xcode DerivedData (per project), `~/.konan`
+     (per Kotlin/Native version and dependency), JetBrains caches (per IDE version),
+     Swift Package Manager (per package) and Gradle versions. Each part goes when nothing
+     in it changed for N days; the rest stays. A Kotlin/Native version that a project's
+     `gradle/libs.versions.toml` names is kept.
+   - Build output and dependencies (`node_modules`, `.venv`, `build` and the like) go
+     only when their project is idle too: no commit and no change to the project's own
+     files for N days. A `git status` is not use.
+   - A git worktree made with `git worktree add` is *ask* until you name it
+     (`policy set git-worktree clean`, 60 days unless you give `--older-than-days`).
+     Then it is offered only when nothing in it is uncommitted or untracked, it holds no
+     ignored files beyond build output (a `.env` keeps it), its branch has an upstream
+     with every commit, and no commit or file changed for N days. It is removed with
+     `git worktree remove`, not moved to the Trash; the branch stays.
+
 Folders macOS keeps private (Mail, Messages, some app data) show as *not measured*, never as
 empty. macOS may ask whether your terminal may open some of them; answer or ignore it. A
 folder macOS holds for more than 20 seconds is skipped, and a whole scan stops after 10
@@ -91,7 +107,8 @@ them and `private remove` undoes one. They live in `~/.config/disk-tool/private.
 
 ## What it never does
 
-- Open or read your files. It looks at sizes and dates only.
+- Open or read your files. It looks at sizes and dates only, except a project's
+  `gradle/libs.versions.toml` (for the Kotlin version) and a git worktree's `.git` file.
 - Use the network or send anything anywhere. No telemetry.
 - Remove your own files (*user*) or anything it does not recognise (*unknown*).
 - Look inside another account's folder, or remove anything outside your home folder.

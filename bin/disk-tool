@@ -3161,6 +3161,16 @@ What it does
            `{name} policy set ~/path keep`; it then leaves the list.
   clean    Lists exactly what your rules would remove and how much that frees.
            Nothing is removed until you run it again with --apply.
+           Some caches are cleaned part by part (Xcode DerivedData, ~/.konan, JetBrains,
+           Swift packages, Gradle versions): each version or project folder inside goes
+           when nothing in it changed for the rule's days; the rest stays. A Kotlin/Native
+           version a project's gradle/libs.versions.toml names is kept.
+           Build output (node_modules, .venv, build ...) goes only when its project is
+           idle too: no commit and no change to its own files for that long.
+           A git worktree (from `git worktree add`) is offered only when the policy
+           names it (`{name} policy set git-worktree clean`, 60 days unless you say),
+           and only when everything in it is committed and pushed and it holds no
+           ignored files beyond build output; `git worktree remove` removes it.
   private  Folders whose contents must never be named, such as an employer's code or
            client work: `{name} private add ~/Developer/Acme`. For each one the
            report shows only its path and total size. Nothing inside it is listed,
@@ -3175,12 +3185,16 @@ What it does
            grows past the limit still alerts; keep means "never clean", not "never look".
 
 What it never does
-  - It never opens or reads your files: it looks at sizes and dates only.
+  - It never opens or reads your files: it looks at sizes and dates only. The one
+    exception: a project's gradle/libs.versions.toml (for its Kotlin version) and a
+    git worktree's .git pointer file.
   - It never uses the network and sends nothing anywhere.
   - It never removes your own files (user) or anything it does not recognise (unknown).
   - It never opens another account's folder, and never removes anything outside your
     home folder; it never follows links out of it,
-    and never touches a git project with uncommitted or unpushed work.
+    and never touches a git project with uncommitted or unpushed work. Its git
+    checks only read (`git status` does not even refresh the index); the one git
+    command that changes anything is `git worktree remove`, for a listed worktree.
   - It never runs by itself: there is no background job unless you set one up.
 
 Where it keeps its files

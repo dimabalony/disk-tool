@@ -294,12 +294,22 @@ PROJECT_FOLDERS = [
       "Python test environments made by tox. tox makes them again."),
 ]
 
+# A linked git worktree (a second checkout made with `git worktree add`), found anywhere
+# projects are looked for. Only ever `clean` when the policy names it (id or path), never
+# through a kind rule; then removed with `git worktree remove` when everything in it is
+# committed and pushed (see worktree_check).
+WORKTREE = E("git-worktree", "dev", "**/(git worktree)", "command",
+             "A linked git worktree: a second checkout of a repository. When everything in it "
+             "is committed and pushed, `git worktree add` brings the branch back; ignored "
+             "files in it are lost.", opt_in=True, default_days=60)
+
 UNKNOWN = E("unknown", "unknown", "*", "no",
             "Not in the catalog. Look at it and decide yourself.")
 PRIVATE = E("private", "private", "*", "no",
             "Private folder: only its total size is measured; nothing inside is listed.")
 
-ENTRIES = {e.id: e for e in CATALOG + [p.entry for p in PROJECT_FOLDERS] + [UNKNOWN, PRIVATE]}
+ENTRIES = {e.id: e for e in CATALOG + [p.entry for p in PROJECT_FOLDERS]
+           + [WORKTREE, UNKNOWN, PRIVATE]}
 
 _BY_KEY = {}
 for _e in CATALOG:
@@ -332,7 +342,7 @@ def match_path(rel):
 
 
 def _project_allowed(rel, owner):
-    if owner is not None and owner.entry.kind != "user":
+    if owner is not None and owner.entry.kind != "user" and owner.entry is not WORKTREE:
         return False
     if rel[0] in ("Library", "Applications") or rel[0].startswith("."):
         return False
@@ -568,6 +578,21 @@ def kotlin_versions(text):
     return sorted(v for v in found if re.match(r"^\d+\.\d+", v))
 
 
+_WORKTREE_GITDIR = re.compile(r"^gitdir: (.+[/\\]worktrees[/\\][^/\\]+)[/\\]?\s*$")
+
+
+def _is_worktree_link(path, st):
+    """Whether a .git file points into another repository's worktrees folder (a linked
+    worktree; a submodule's points into modules)."""
+    if st.st_size > 4096 or getattr(st, "st_flags", 0) & SF_DATALESS:
+        return False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return bool(_WORKTREE_GITDIR.match(f.read(4096)))
+    except OSError:
+        return False
+
+
 def _read_version_catalog(path, st):
     if (not stat.S_ISREG(st.st_mode) or st.st_size > VERSION_CATALOG_MAX
             or getattr(st, "st_flags", 0) & SF_DATALESS):
@@ -728,6 +753,8 @@ def walker_main(base):
                             newest = st.st_mtime if st.st_mtime > st.st_ctime else st.st_ctime
                             if match and de.name == ".git":
                                 msg["g"] = 1
+                                if stat.S_ISREG(st.st_mode) and _is_worktree_link(de.path, st):
+                                    msg["wt"] = 1
                             if (match and de.name == VERSION_CATALOG and rel
                                     and rel[-1] == "gradle" and rel[0] not in NO_READ_TOP):
                                 kv = _read_version_catalog(de.path, st)
@@ -1031,6 +1058,9 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
         rows, names, subs = msg["e"], None, {}
         for version in msg.get("kv") or ():
             pins.append({"version": version, "project": "/".join(rel[:-1])})
+        if (msg.get("wt") and rel and rel not in items and _project_allowed(rel, owner)
+                and (owner is None or owner.rel != rel)):
+            owner = items[rel] = Item(rel, WORKTREE)  # takes what is inside from the owner
         in_output = owner is not None and owner.entry.id in _PROJECT_IDS
         own, every, is_project, hidden = 0.0, 0.0, bool(msg.get("g")), False
         for name, kind, size, newest, link, markers in rows:
@@ -2030,7 +2060,11 @@ def rule_for(policy, entry, rel=None):
     """The rule that applies to one item: its path's (rel, "a/b"), else its catalog
     entry's, else its kind's, else ask."""
     rule = ((policy.get("paths", {}).get(rel) if rel is not None else None)
-            or policy.get("items", {}).get(entry.id) or policy.get("kinds", {}).get(entry.kind))
+            or policy.get("items", {}).get(entry.id))
+    if rule is None:
+        rule = policy.get("kinds", {}).get(entry.kind)
+        if entry.opt_in and rule and rule.get("action") == "clean":
+            rule = None  # cleaned only when the policy names it, never through its kind
     rule = dict(rule or {"action": "ask"})
     if entry.kind in NEVER_CLEAN or entry.protected:
         if rule["action"] == "clean":  # belt and braces: validate_policy already refuses it
@@ -2100,6 +2134,8 @@ def cmd_policy(args, home):
         elif target.startswith(("~", "/")) or "/" in target:
             rel = _item_rel(home, target)
             entry = ENTRIES.get(rel_id(home, rel), UNKNOWN)
+            if action == "clean" and args.older_than_days is None and entry.default_days:
+                rule["older_than_days"] = entry.default_days
             if action == "clean" and entry.protected:
                 raise PolicyError(f"{disp(rel)} is never removed by this tool: "
                                   f"{entry.description}")
@@ -2108,6 +2144,8 @@ def cmd_policy(args, home):
             target = disp(rel)
         elif target in ENTRIES and target not in ("unknown", "private"):
             entry = ENTRIES[target]
+            if action == "clean" and args.older_than_days is None and entry.default_days:
+                rule["older_than_days"] = entry.default_days
             _check_rule(target, rule, entry.kind, entry.protected)
             policy.setdefault("items", {})[target] = rule
         else:
@@ -2551,19 +2589,86 @@ def check_path(home, path, container=False):
     return None
 
 
-def _git(repo, *argv):
+def _git_proc(repo, *argv):
     # The repo may sit inside a downloaded cache, so switch off what its own config
-    # could make git run, and any network transport.
+    # could make git run, and any network transport. GIT_OPTIONAL_LOCKS=0 keeps
+    # `git status` from writing the index.
     env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
     hardening = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
                  "-c", "core.untrackedCache=false", "-c", "protocol.allow=never"]
     try:
-        proc = subprocess.run(["git"] + hardening + ["-C", repo] + list(argv),
+        return subprocess.run(["git"] + hardening + ["-C", repo] + list(argv),
                               capture_output=True,
                               text=True, env=env, timeout=60, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return proc.stdout if proc.returncode == 0 else None
+
+
+def _git(repo, *argv):
+    proc = _git_proc(repo, *argv)
+    return proc.stdout if proc is not None and proc.returncode == 0 else None
+
+
+# Ignored files `git worktree remove` may take with it: folders that rebuild.
+WORKTREE_IGNORED_OK = set(_PROJECT_BY_NAME) | {".DS_Store", "__pycache__"}
+
+
+def worktree_check(home, path):
+    """(why this worktree must stay, None) or (None, {"upstream", "commit"}). It may go
+    when it is a linked worktree, nothing in it is uncommitted or untracked, the files
+    git ignores are only rebuildable folders, and its branch has an upstream that holds
+    every commit. Reads only: `git status` runs with GIT_OPTIONAL_LOCKS=0."""
+    out = _git(path, "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel")
+    lines = out.splitlines() if out else []
+    if len(lines) < 3:
+        return "git could not read this worktree", None
+    git_dir = os.path.realpath(lines[0])
+    common = os.path.realpath(os.path.join(path, lines[1]))
+    if git_dir == common:
+        return "not a linked git worktree", None
+    if os.path.realpath(lines[2]) != os.path.realpath(path):
+        return "not the top folder of its git worktree", None
+    status = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal")
+    if status is None:
+        return "git could not check it for changes", None
+    lost = []
+    for line in status.splitlines():
+        if not line.startswith("!! "):
+            return "it has uncommitted or untracked changes", None
+        name = os.path.basename(line[3:].strip().strip('"').rstrip("/"))
+        if name not in WORKTREE_IGNORED_OK:
+            lost.append(line[3:].strip())
+    if lost:
+        return (f"it holds files git ignores that would be lost, such as {lost[0]}; "
+                "remove it yourself if they are not needed"), None
+    upstream = _git(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if not upstream or not upstream.strip():
+        return "its branch has no upstream, so nothing shows it is pushed", None
+    upstream = upstream.strip()
+    ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
+    if ahead is None or not ahead.strip().isdigit():
+        return "git could not compare it with its upstream", None
+    if int(ahead) > 0:
+        return f"it has {int(ahead)} commits not pushed to {upstream}", None
+    commit = last_commit(path)
+    if commit is None:
+        return "could not read its last commit", None
+    return None, {"upstream": upstream, "commit": commit}
+
+
+def remove_worktree(home, path):
+    """`git worktree remove` (never --force): git itself refuses a worktree that is not
+    clean. The branch stays in the repository."""
+    reason = check_path(home, path)
+    if reason:
+        return None, reason
+    proc = _git_proc(path, "worktree", "remove", path)
+    if proc is None or proc.returncode != 0:
+        err = (proc.stderr.strip().splitlines() or ["git failed"])[-1] if proc else "git failed"
+        return None, f"git worktree remove refused: {err}"
+    if os.path.lexists(path):
+        return None, "git worktree remove left it in place"
+    return "git worktree remove", None
 
 
 def git_check(home, path, git_dirs):
@@ -2661,13 +2766,16 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
             rules[rec["rel"]] = (entry, rule_for(policy, entry, rec["rel"]))
         return rules[rec["rel"]]
 
-    def blocking(rel):
-        """A record inside `rel` that this clean must not remove with it, or None."""
+    def blocking(rel, rebuildable_ok=False):
+        """A record inside `rel` that this clean must not remove with it, or None.
+        rebuildable_ok: build output (node_modules ...) may go with it unless kept."""
         for other in records.values():
             if other["rel"].startswith(rel + "/"):
                 o_entry, o_rule = rule(other)
+                ok = rebuildable_ok and o_entry.id in _PROJECT_IDS
                 if o_entry.kind in NEVER_CLEAN or o_entry.protected or (
-                        o_rule["action"] != "clean" and not only) or o_rule["action"] == "keep":
+                        o_rule["action"] != "clean" and not only and not ok) or (
+                        o_rule["action"] == "keep"):
                     return other, o_entry
         return None
 
@@ -2715,7 +2823,7 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
         elif any(f.startswith(rec["rel"] + "/") for f in private):
             reason = "it holds a private folder"
         if reason is None and not entry.units:
-            found = blocking(rec["rel"])
+            found = blocking(rec["rel"], rebuildable_ok=entry is WORKTREE)
             if found:
                 reason = (f"it holds {disp(found[0]['rel'])} ({found[1].kind}), "
                           f"which your policy does not clean")
@@ -2748,6 +2856,18 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                 reason = "could not look inside all of it"
             elif m["mount"]:
                 reason = "another disk is mounted inside it"
+            elif row["id"] == WORKTREE.id:
+                reason, info = worktree_check(home, row["path"])
+                if reason is None:
+                    row["days_unchanged"] = days_since(max(m["newest"], info["commit"]), now)
+                    row["upstream"], row["removed_with"] = info["upstream"], "git worktree remove"
+                    if not only and row["days_unchanged"] < r["older_than_days"]:
+                        reason = (f"in use {row['days_unchanged']} days ago (its last commit "
+                                  "or a file in it)")
+                    elif any(g != row["path"] for g in m["git"]):
+                        reason = "it holds another git project"
+                    else:
+                        reason = git_check(home, row["path"], [])
             elif not only and row["days_unchanged"] < r["older_than_days"]:
                 reason = f"changed {row['days_unchanged']} days ago"
             elif not only and row["id"] in _PROJECT_IDS:
@@ -2759,12 +2879,16 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                               "commit or a file outside .git and build output changed)")
                 else:
                     row["project"], row["project_idle_days"] = where, idle
-            if reason is None:
+            if reason is None and row["id"] != WORKTREE.id:
                 reason = git_check(home, row["path"], m["git"])
         row["reason"] = reason
     if unit_rows:
         rows = [u for row in rows for u in unit_rows.get(row["rel"], [row])]
+    going = [row["rel"] for row in rows if row["id"] == WORKTREE.id and row["reason"] is None]
     for row in rows:
+        around = next((w for w in going if row["rel"].startswith(w + "/")), None)
+        if around and row["reason"] is None:
+            row["reason"] = f"goes with the git worktree {disp(around)} around it"
         row["remove"] = row["reason"] is None
     return rows, recent
 
@@ -2921,7 +3045,10 @@ def cmd_clean(args, home):
             row["reason"] = "was not in the dry run you checked"
             skipped.append(row)
             continue
-        how, reason = remove_item(home, row["path"], row["rel"])
+        if row["id"] == WORKTREE.id:
+            how, reason = remove_worktree(home, row["path"])
+        else:
+            how, reason = remove_item(home, row["path"], row["rel"])
         if how:
             row["done"] = how
             done.append(row)
@@ -2955,6 +3082,10 @@ def cmd_clean(args, home):
 
 def _why_text(r):
     """Why a dry-run row may go, in a few words."""
+    if r.get("removed_with"):
+        return (f"git worktree: everything committed and pushed to {r['upstream']}, no commit "
+                f"or file change for {r['days_unchanged']} days; removed with "
+                "`git worktree remove`, not moved to the Trash; the branch stays")
     text = f"unchanged {r['days_unchanged']} days"
     if r.get("project_idle_days") is not None:
         text += f"; project {disp(r['project'])} idle {r['project_idle_days']} days"
@@ -2995,6 +3126,9 @@ def _report_plan(args, scan, rows, recent):
         print()
         print(f"To remove exactly the {len(keep)} above: {NAME} clean{extra} --apply")
         print("Items go to the Trash (items already in the Trash are deleted).")
+        if any(r.get("removed_with") for r in keep):
+            print("Git worktrees are removed with `git worktree remove` instead, which "
+                  "deletes them; their branches stay in the repository.")
     return 0
 
 

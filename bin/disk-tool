@@ -2656,7 +2656,11 @@ def worktree_check(home, path):
         return "its repository does not list it as a worktree", None
     if _repo_config_runs_programs(path):
         return "its repository sets programs for git to run in its own config", None
-    status = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal")
+    if (os.path.lexists(os.path.join(path, ".gitmodules"))
+            or os.path.lexists(os.path.join(git_dir, "modules"))):
+        return "it has git submodules (git worktree remove refuses those)", None
+    status = _git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal",
+                  "--ignore-submodules=all")
     if status is None:
         return "git could not check it for changes", None
     lost = []
@@ -2705,7 +2709,9 @@ def git_check(home, path, git_dirs):
         name = disp(os.path.relpath(repo, home))
         if _repo_config_runs_programs(repo):
             return f"git project {name} sets programs for git to run in its own config"
-        status = _git(repo, "status", "--porcelain")
+        # Submodules are not entered here: each is a .git of its own in the walk, and
+        # gets this same check, config gate first.
+        status = _git(repo, "status", "--porcelain", "--ignore-submodules=all")
         if status is None:
             return f"git project {name} could not be checked"
         if status.strip():

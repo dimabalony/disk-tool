@@ -178,6 +178,28 @@ class WorktreeTest(HomeTestCase):
         self.assertIn("does not list it as a worktree", left["Developer/fake"])
         self.assertTrue(os.path.isdir(fake))
 
+    def test_a_worktree_with_submodules_is_refused_without_entering_them(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        lib = os.path.join(self.outside, "lib-src")
+        os.makedirs(lib)
+        with open(os.path.join(lib, "x"), "w") as f:
+            f.write("x")
+        git(lib, "init", "-q")
+        git(lib, "add", ".")
+        git(lib, "commit", "-q", "-m", "lib")
+        git(done, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib, "lib")
+        git(done, "commit", "-q", "-m", "add lib")
+        git(done, "push", "-q")
+        marker = os.path.join(self.outside, "ran")
+        git(os.path.join(done, "lib"), "config", "filter.x.clean", f"touch {marker}; cat")
+        with open(os.path.join(done, "lib", ".gitattributes"), "w") as f:
+            f.write("* filter=x\n")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("submodules", left["Developer/done"])
+        self.assertFalse(os.path.exists(marker))
+
     def test_a_submodule_is_not_a_worktree(self):
         sub = os.path.join(self.outside, "lib.git")
         git(self.outside, "init", "-q", "--bare", sub)

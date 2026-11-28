@@ -53,8 +53,10 @@ now. Later, ask *"what's on my disk?"* and it leads with what changed since last
      (`policy set git-worktree clean`, 60 days unless you give `--older-than-days`).
      Then it is offered only when it is not locked, nothing in it is uncommitted, staged
      or untracked, it holds no ignored files beyond build output (a `.env` or a key file
-     keeps it, inside build output too), its branch has an upstream with every commit,
-     and no commit or file changed for N days. Its repository must be inside your home
+     keeps it, inside build output too), no file is marked assume-unchanged or
+     skip-worktree, its branch has a remote-tracking upstream with every commit (as far
+     as this Mac knows: git does not ask the server), and no commit or file changed for
+     N days. Its repository must be inside your home
      folder. `--apply` checks all of this again right before it runs `git worktree
      remove`, which removes it instead of moving it to the Trash; the branch stays.
    - `clean --path <item>` is your own pick: it skips the *unused for N days* wait and

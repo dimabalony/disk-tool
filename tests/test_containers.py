@@ -133,6 +133,32 @@ class ContainerTest(HomeTestCase):
         left = {r["rel"]: r["reason"] for r in plan["left_alone"]}
         self.assertIn("uncommitted changes", left["Library/Caches/JetBrains/IdeaIC2023.1"])
 
+    def test_a_private_folder_keeps_only_its_own_unit(self):
+        dd = "Library/Developer/Xcode/DerivedData"
+        self.write(f"{dd}/Old-abc/Build/Products/app.o", 200 * 1024)
+        self.write(f"{dd}/Mine-xyz/Build/Products/app.o", 100 * 1024)
+        self.run_tool("policy", "init")
+        self.run_tool("private", "add", f"~/{dd}/Mine-xyz/Build")
+        self.run_tool("scan")
+        plan = self.plan()
+        self.assertEqual([r["rel"] for r in plan["remove"]], [f"{dd}/Old-abc"])
+        left = {r["rel"]: r["reason"] for r in plan["left_alone"]}
+        self.assertIn("private", left[f"{dd}/Mine-xyz"])
+
+    def test_policy_set_takes_one_unit_of_a_container(self):
+        dd = "Library/Developer/Xcode/DerivedData"
+        self.write(f"{dd}/Old-abc/Build/Products/app.o", 200 * 1024)
+        self.write(f"{dd}/Keep-def/Build/Products/app.o", 200 * 1024)
+        self.run_tool("policy", "init")
+        self.run_tool("scan")
+        rc, out = self.run_tool("policy", "set", f"~/{dd}/Keep-def", "keep")
+        self.assertEqual(rc, 0, out)
+        plan = self.plan()
+        self.assertEqual([r["rel"] for r in plan["remove"]], [f"{dd}/Old-abc"])
+        rc, out = self.run_tool("policy", "set", f"~/{dd}/Keep-def/Build", "keep")
+        self.assertNotEqual(rc, 0, out)  # deeper than a unit: not an item
+        self.assertIn("not an item from the last scan", out)
+
 
 class KotlinPinTest(HomeTestCase):
     """~/.konan: a Kotlin/Native version a project's version catalog names is kept."""
@@ -241,6 +267,32 @@ class KotlinPinTest(HomeTestCase):
             with open(self.tool.state_dir(self.home) + "/" + name) as f:
                 data = json.load(f)
             self.assertEqual((data["kotlin_pins"], data["kotlin_catalogs"]), ([], []), name)
+
+    def test_parser_takes_headers_with_comments_and_refuses_odd_ones(self):
+        text = '[versions] # shared\nkotlin = "2.0.0" # pinned\n'
+        self.assertEqual(self.tool.kotlin_versions(text), ["2.0.0"])
+        self.assertIsNone(self.tool.kotlin_versions('["versions"]\nkotlin = "2.0.0"\n'))
+
+    def test_a_catalog_folder_reached_through_a_link_is_not_read_again(self):
+        import os
+        cat = "Developer/app/gradle/libs.versions.toml"
+        self.catalog(cat, '[versions]\nkotlin = "2.0.0"\n')
+        self.run_tool("scan")
+        remove, _left = self.plan()
+        self.assertEqual(remove, [".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"])
+        self.run_tool("clean")
+        app = os.path.join(self.home, "Developer/app")
+        os.rename(app, os.path.join(self.outside, "app"))
+        os.symlink(os.path.join(self.outside, "app"), app)  # the folder now leaves home
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(json.loads(out)["removed"], [])
+        skipped = json.loads(out)["skipped"]
+        self.assertIn("could not read ~/Developer/app/gradle/libs.versions.toml",
+                      skipped[0]["reason"])
+        self.assertTrue(self.exists(".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"))
+        scan = self.tool.latest_scan(self.home)
+        self.assertEqual(self.tool.read_catalogs_again(self.home, scan, ["Developer/app"],
+                                                       60, 20), {"Developer/app": "private"})
 
     def test_parser_resolves_refs_whatever_the_table_order(self):
         text = ('[plugins]\nkmp = { id = "org.jetbrains.kotlin.multiplatform", '

@@ -130,8 +130,42 @@ class IdleProjectTest(HomeTestCase):
     def test_apply_still_removes_an_unchanged_idle_project(self):
         self.project("plain", use_git=False)
         remove, _left = self.plan()
+        self.assertIn("Developer/plain/node_modules", remove)
         rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(rc, 0, out)
         self.assertEqual([r["rel"] for r in json.loads(out)["removed"]], remove)
+        self.assertFalse(os.path.exists(os.path.join(self.home, "Developer/plain/node_modules")))
+
+    def test_an_unreadable_folder_in_build_output_does_not_hide_use(self):
+        self.project("plain", use_git=False)
+        locked = self.mkdir("Developer/plain/node_modules/dep/locked")
+        os.chmod(locked, 0)
+        result, _items = self.scan()
+        self.assertFalse(result["projects"]["Developer/plain"]["partial"])
+        os.chmod(locked, 0o700)
+        own = self.mkdir("Developer/plain/src/locked")
+        os.chmod(own, 0)  # one of the project's own folders: its use is not known
+        result, _items = self.scan()
+        self.assertTrue(result["projects"]["Developer/plain"]["partial"])
+        os.chmod(own, 0o700)
+
+    def test_activity_walk_does_not_enter_build_output(self):
+        self.project("plain", use_git=False)
+        self.write("Developer/plain/node_modules/dep/deep/x.js", 10)
+        remove, _left = self.plan()
+        self.assertEqual(remove, ["Developer/plain/node_modules"])
+        seen, real_walk = [], self.tool.walk
+
+        def spy(base, roots, on_listing, *args, **kwargs):
+            def listing(rel, ctx, msg):
+                seen.append(rel)
+                return on_listing(rel, ctx, msg)
+            return real_walk(base, roots, listing, *args, **kwargs)
+        self.tool.walk = spy
+        again = self.tool.project_activity(self.home, "Developer/plain", 60, 20, [])
+        self.assertIsNotNone(again)
+        self.assertIn(("Developer", "plain", "src"), seen)
+        self.assertFalse([r for r in seen if "node_modules" in r], seen)
 
     def test_staged_submodule_pointer_in_build_output_keeps_it(self):
         root = self.project("staged")

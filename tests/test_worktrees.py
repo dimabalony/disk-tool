@@ -96,7 +96,8 @@ class WorktreeTest(HomeTestCase):
 
         rc, out = self.run_tool("clean")
         self.assertIn("~/Developer/done  (git worktree: everything committed and pushed to "
-                      "origin/done, no commit or file change for 70 days", out)
+                      "origin/done as far as this Mac knows (not checked with the server), "
+                      "no commit or file change for 70 days", out)
         self.assertIn("removed with `git worktree remove`", out)
         rc, out = self.run_tool("clean", "--apply", "--json")
         self.assertEqual(rc, 0, out)
@@ -327,6 +328,113 @@ class WorktreeTest(HomeTestCase):
         self.assertEqual(remove, [])
         self.assertIn("outside your home folder", left["Developer/far"])
         self.assertTrue(os.path.isdir(path))
+
+    def test_files_hidden_from_status_keep_the_worktree(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        for name, flag in (("assumed", "--assume-unchanged"), ("skipped", "--skip-worktree")):
+            path = self.worktree(name)
+            git(path, "update-index", flag, "README")
+            with open(os.path.join(path, "README"), "w") as f:
+                f.write("edited, and git status does not show it")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        for name in ("assumed", "skipped"):
+            self.assertIn("assume-unchanged or skip-worktree", left["Developer/" + name])
+
+    def test_key_names_match_whatever_their_case(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        for name, key in (("upper", "SERVER.PEM"), ("env", ".ENV"), ("ok", "Index.js")):
+            self.worktree(name)
+            self.commit_file(name, "package.json")
+            self.write(f"Developer/{name}/node_modules/dep/{key}", 10)
+        remove, left = self.plan()
+        self.assertEqual(remove, ["Developer/ok"])
+        self.assertIn("SERVER.PEM", left["Developer/upper"])
+        self.assertIn(".ENV", left["Developer/env"])
+
+    def test_a_local_branch_upstream_is_not_a_push(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        path = self.worktree("tracks-main", push=False)
+        git(path, "branch", "--set-upstream-to=main")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("upstream main is a local branch", left["Developer/tracks-main"])
+
+    def test_a_private_repository_keeps_its_worktrees(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        _remove, _left = self.plan()
+        rc, out = self.run_tool("clean", "--json")
+        row = json.loads(out)["remove"][0]
+        planned = {"upstream": row["upstream"], "head": row["head"]}
+        # right before removal: the admin folder is inside a private folder now
+        how, why, _partly = self.tool.remove_worktree(self.home, done, planned,
+                                                      ["Developer/app"])
+        self.assertIsNone(how)
+        self.assertIn("its folder in the repository is or holds a private folder", why)
+        self.assertNotIn("worktrees", why)  # names nothing inside the private folder
+        rc, out = self.run_tool("private", "add", "~/Developer/app")
+        self.assertEqual(rc, 0, out)
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("its folder in the repository", left["Developer/done"])
+        self.assertTrue(os.path.isdir(done))
+
+    def test_apply_uses_the_commit_the_dry_run_approved(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        remove, _left = self.plan()
+        self.assertEqual(remove, ["Developer/done"])
+        self.commit_file("done", "later.txt")  # committed and pushed after the dry run
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(rc, 0, out)
+        applied = json.loads(out)
+        self.assertEqual(applied["removed"], [])
+        self.assertIn("changed since the dry run; run the dry run again",
+                      applied["skipped"][0]["reason"])
+        self.assertTrue(os.path.isdir(done))
+        # a plan file without the approved commit: the worktree stays
+        rc, out = self.run_tool("clean")
+        plan = self.tool._plan_file(self.home)
+        with open(plan) as f:
+            data = json.load(f)
+        self.assertIn("Developer/done", data["worktrees"])
+        del data["worktrees"]
+        with open(plan, "w") as f:
+            json.dump(data, f)
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        applied = json.loads(out)
+        self.assertEqual(applied["removed"], [])
+        self.assertIn("run the dry run again", applied["skipped"][0]["reason"])
+        self.assertTrue(os.path.isdir(done))
+
+    def test_rows_refused_at_apply_are_listed_as_skipped(self):
+        self.run_tool("policy", "set", "git-worktree", "clean")
+        done = self.worktree("done")
+        self.worktree("gone")
+        remove, _left = self.plan()
+        self.assertEqual(sorted(remove), ["Developer/done", "Developer/gone"])
+        self.write("Developer/done/notes.txt", 10)  # untracked, after the dry run
+        self.run_tool("policy", "set", "~/Developer/gone", "keep")
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        self.assertEqual(rc, 0, out)
+        applied = json.loads(out)
+        self.assertEqual(applied["removed"], [])
+        skipped = {r["rel"]: r["reason"] for r in applied["skipped"]}
+        self.assertIn("uncommitted or untracked", skipped["Developer/done"])
+        self.assertIn("Developer/gone", skipped)
+        self.assertTrue(os.path.isdir(done))
+        # approved by a dry run, then no clean rule names them: not even a row at apply
+        os.unlink(os.path.join(done, "notes.txt"))
+        self.run_tool("policy", "set", "~/Developer/gone", "clean")
+        remove, _left = self.plan()
+        self.assertEqual(sorted(remove), ["Developer/done", "Developer/gone"])
+        self.run_tool("policy", "set", "git-worktree", "ask")
+        self.run_tool("policy", "set", "~/Developer/gone", "ask")
+        rc, out = self.run_tool("clean", "--apply")
+        self.assertIn("Removed nothing.", out)
+        self.assertIn("Skipped:", out)
+        self.assertIn("not planned for removal any more", out)
 
     def test_relative_paths_worktree(self):
         self.run_tool("policy", "set", "git-worktree", "clean")

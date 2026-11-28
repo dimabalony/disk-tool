@@ -1,0 +1,123 @@
+"""Build output and dependencies (node_modules, .venv, build) go only when their project
+has been idle for the rule's days: no commit and no change to its own files. A fresh
+.git/index (what `git status` leaves behind) is not use."""
+
+import json
+import os
+import subprocess
+import time
+import unittest
+
+from helpers import HAS_GIT, HomeTestCase, git
+
+
+@unittest.skipUnless(HAS_GIT, "needs git")
+class IdleProjectTest(HomeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.shift_clock(40)  # everything written now looks 40 days old
+        self.run_tool("policy", "init")
+        self.run_tool("policy", "set", "node-modules", "clean", "--older-than-days", "30")
+
+    def project(self, name, use_git=True):
+        root = os.path.dirname(self.write(f"Developer/{name}/package.json", 10))
+        self.write(f"Developer/{name}/src/index.js", 10)
+        self.write(f"Developer/{name}/node_modules/dep/index.js", 100 * 1024)
+        with open(os.path.join(root, ".gitignore"), "w") as f:
+            f.write("node_modules/\n")
+        if use_git:
+            git(root, "init", "-q")
+            git(root, "add", ".")
+            git(root, "commit", "-q", "-m", "first")
+        return root
+
+    def plan(self):
+        self.run_tool("scan")
+        rc, out = self.run_tool("clean", "--json")
+        self.assertEqual(rc, 0, out)
+        data = json.loads(out)
+        return ([r["rel"] for r in data["remove"]],
+                {r["rel"]: r["reason"] for r in data["left_alone"]})
+
+    def test_fresh_git_index_is_not_use_but_a_fresh_file_is(self):
+        idle = self.project("idle")
+        subprocess.run(["git", "-C", idle, "status"], capture_output=True, check=True)
+        self.touch_future("Developer/idle/.git", 39)  # index and .git look used yesterday
+        self.project("active")
+        self.touch_future("Developer/active/src/index.js", 39)  # edited yesterday
+        remove, left = self.plan()
+        self.assertEqual(remove, ["Developer/idle/node_modules"])
+        self.assertIn("its project ~/Developer/active was in use 1 days ago",
+                      left["Developer/active/node_modules"])
+        rc, out = self.run_tool("clean")
+        self.assertIn("project ~/Developer/idle idle 40 days", out)
+        rc, out = self.run_tool("clean", "--apply", "--json")
+        done = json.loads(out)
+        self.assertEqual([r["rel"] for r in done["removed"]], remove)
+        self.assertFalse(os.path.exists(os.path.join(idle, "node_modules")))
+        self.assertTrue(os.path.exists(os.path.join(self.home,
+                                                    "Developer/active/node_modules")))
+
+    def test_a_recent_commit_is_use(self):
+        root = self.project("committed")
+        future = str(int(time.time() + 39 * 86400))
+        env = dict(os.environ, GIT_COMMITTER_DATE=future + " +0000",
+                   GIT_AUTHOR_DATE=future + " +0000")
+        with open(os.path.join(root, "README"), "w") as f:
+            f.write("x")
+        os.utime(os.path.join(root, "README"), (time.time(), time.time()))
+        subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@example.invalid",
+                        "-c", "commit.gpgsign=false", "-C", root, "add", "."],
+                       check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-c", "user.name=T", "-c", "user.email=t@example.invalid",
+                        "-c", "commit.gpgsign=false", "-C", root, "commit", "-q", "-m", "2"],
+                       check=True, capture_output=True, env=env)
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("was in use 1 days ago", left["Developer/committed/node_modules"])
+
+    def test_a_project_without_git_uses_its_files(self):
+        self.project("plain-idle", use_git=False)
+        self.project("plain-active", use_git=False)
+        self.touch_future("Developer/plain-active/src", 39)
+        remove, left = self.plan()
+        self.assertEqual(remove, ["Developer/plain-idle/node_modules"])
+        self.assertIn("was in use", left["Developer/plain-active/node_modules"])
+
+    def test_build_output_changes_are_not_use(self):
+        self.project("rebuilt", use_git=False)
+        self.write("Developer/rebuilt/.next/cache/x", 10)  # another build folder
+        self.touch_future("Developer/rebuilt/.next", 39)
+        remove, _left = self.plan()
+        self.assertEqual(remove, ["Developer/rebuilt/node_modules"])
+
+    def test_a_submodule_of_a_git_project_counts_the_whole_checkout(self):
+        root = self.project("mono")
+        self.write("Developer/mono/packages/web/package.json", 10)
+        self.write("Developer/mono/packages/web/node_modules/dep/index.js", 10)
+        self.write("Developer/mono/packages/api/main.js", 10)
+        self.touch_future("Developer/mono/packages/api", 39)  # edited elsewhere in the repo
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", "more")
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("its project ~/Developer/mono was in use",
+                      left["Developer/mono/packages/web/node_modules"])
+
+    def test_an_old_scan_without_project_data_cleans_no_build_output(self):
+        self.project("idle")
+        self.run_tool("scan")
+        path = self.tool.state_dir(self.home) + "/latest.json"
+        with open(path) as f:
+            data = json.load(f)
+        del data["projects"]
+        with open(path, "w") as f:
+            json.dump(data, f)
+        rc, out = self.run_tool("clean", "--json")
+        data = json.loads(out)
+        self.assertEqual(data["remove"], [])
+        self.assertIn("scan again", data["left_alone"][0]["reason"])
+
+
+if __name__ == "__main__":
+    unittest.main()

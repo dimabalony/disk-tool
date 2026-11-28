@@ -306,6 +306,7 @@ for _e in CATALOG:
     _parts = tuple(_e.pattern.split("/"))
     _BY_KEY.setdefault((_parts[0], len(_parts)), []).append((_parts, _e))
 _MAX_DEPTH = max(len(e.pattern.split("/")) for e in CATALOG)
+_PROJECT_IDS = {p.entry.id for p in PROJECT_FOLDERS}
 _PROJECT_BY_NAME = {}
 for _p in PROJECT_FOLDERS:
     for _n in _p.names:
@@ -725,6 +726,8 @@ def walker_main(base):
                                 continue
                             size = st.st_blocks * 512
                             newest = st.st_mtime if st.st_mtime > st.st_ctime else st.st_ctime
+                            if match and de.name == ".git":
+                                msg["g"] = 1
                             if (match and de.name == VERSION_CATALOG and rel
                                     and rel[-1] == "gradle" and rel[0] not in NO_READ_TOP):
                                 kv = _read_version_catalog(de.path, st)
@@ -976,7 +979,15 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
     private_rels = {tuple(p.split("/")) for p in private}
     items, unknown, not_measured, seen, no_answer = {}, {}, [], set(), []
     pins = []  # Kotlin versions projects name in gradle/libs.versions.toml
+    # Project folders (those holding build output or a .git) and when anything in them
+    # last changed: "newest" leaves out .git and the build output, "newest_all" only .git.
+    # chains: folder not listed yet -> the project folders it is in.
+    projects, chains = {}, {}
     stats = {"folders": 0, "bytes": 0, "shown": t0}
+
+    def unseen(chain):
+        for p in chain:
+            projects[p]["partial"] = True
 
     def anchor(name):
         if name not in unknown:
@@ -1001,14 +1012,17 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
 
     def on_listing(rel, owner, msg):
         stats["folders"] += 1
+        chain = chains.pop(rel, ())
         if "err" in msg:
             if msg["err"] == "gone":
                 return {}
             if not rel:
                 raise SystemExit(f"{NAME}: cannot read {home}")
             blocked(rel, owner, msg["err"])
+            unseen(chain)
             return {}
         if "p" in msg:  # a private folder: its total, nothing else
+            unseen(chain)
             total, unread = msg["p"]
             owner.bytes += total
             owner.partial = owner.partial or unread > 0
@@ -1017,12 +1031,17 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
         rows, names, subs = msg["e"], None, {}
         for version in msg.get("kv") or ():
             pins.append({"version": version, "project": "/".join(rel[:-1])})
+        in_output = owner is not None and owner.entry.id in _PROJECT_IDS
+        own, every, is_project, hidden = 0.0, 0.0, bool(msg.get("g")), False
         for name, kind, size, newest, link, markers in rows:
             crel = rel + (name,)
             if kind == 2:
                 not_measured.append({"rel": "/".join(crel), "reason": "other-disk"})
                 continue
+            if name != ".git":
+                every = max(every, newest)
             if crel in private_rels:
+                hidden = True
                 item = items[crel] = Item(crel, PRIVATE)
                 (owner if owner is not None else anchor(crel[0])).private_children.append(item)
                 item.bytes += size
@@ -1038,6 +1057,10 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
             if entry is not None:
                 child_owner = Item(crel, entry)
                 items[crel] = child_owner
+                is_project = is_project or entry.id in _PROJECT_IDS
+            if name != ".git" and not in_output and (entry is None
+                                                      or entry.id not in _PROJECT_IDS):
+                own = max(own, newest)
             if link:
                 key = tuple(link)
                 if key in seen:
@@ -1053,10 +1076,27 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
             size, newest, _count = msg["f"]
             (owner if owner is not None else anchor(rel[0])).add_files(rel, size, newest)
             stats["bytes"] += size
+            every = max(every, newest)
+            if not in_output:
+                own = max(own, newest)
+        if is_project and rel and _project_allowed(rel, owner) and rel not in projects:
+            projects[rel] = {"newest": 0.0, "newest_all": 0.0, "git": bool(msg.get("g")),
+                             "partial": False}
+            chain = chain + (rel,)
+        if chain:
+            for p in chain:
+                d = projects[p]
+                d["newest"], d["newest_all"] = max(d["newest"], own), max(d["newest_all"], every)
+            if hidden:
+                unseen(chain)
+            for name, kind, *_rest in rows:
+                if kind == 1 and name != ".git":
+                    chains[rel + (name,)] = chain
         return subs
 
     def on_no_answer(rel, owner, why, waited):
         blocked(rel, owner, why)
+        unseen(chains.pop(rel, ()))
         no_answer.append(rel)
         if progress:
             text = (f"macOS did not answer in {_duration(waited)} (privacy prompt?)"
@@ -1066,6 +1106,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
     def on_skipped(parent, rows, why):
         for rel, owner in rows:
             mark(rel, owner)
+            unseen(chains.pop(rel, ()))
         reason = "skipped-after-stalls" if why == "parent" else "skipped-stall-budget"
         # names: which folders were skipped, so the next scan can tell "measured now,
         # skipped last time" from "new" (saved scans only; not in `scan --json`)
@@ -1092,6 +1133,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
     # What the time limit left out: the items concerned are only partly measured.
     areas = {}
     for rel, owner in pending.items():
+        unseen(chains.pop(rel, ()))
         if not rel:
             areas[()] = "not started"
             continue
@@ -1147,6 +1189,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
         "kinds": {k: sum(r["bytes"] for r in records if r["kind"] == k) for k in KINDS},
         "not_measured": sorted(not_measured, key=lambda r: r["rel"]),
         "kotlin_pins": sorted(pins, key=lambda r: (r["version"], r["project"])),
+        "projects": {"/".join(rel): d for rel, d in sorted(projects.items())},
         "items": records,
     }
 
@@ -1466,7 +1509,7 @@ def scan_view(result, changes, top):
         }
     blocked = result["not_measured"]
     view = {k: v for k, v in result.items()
-            if k not in ("items", "kinds", "not_measured", "kotlin_pins")}
+            if k not in ("items", "kinds", "not_measured", "kotlin_pins", "projects")}
     view["outside"] = result.get("outside", {"scanned": False})
     view["kinds"] = kinds
     view["not_measured"] = [{k: v for k, v in r.items() if k != "names"}
@@ -2326,6 +2369,9 @@ def scrub_saved(home, folder):
                 r.pop("names", None)  # names inside it; without them the whole is unknown
         data["not_reached"] = [r for r in data.get("not_reached", [])
                                if not r["rel"].startswith(folder + "/")]
+        if "projects" in data:
+            data["projects"] = {rel: d for rel, d in data["projects"].items()
+                                if not _inside(rel, [folder])}
         if "kotlin_pins" in data:
             data["kotlin_pins"] = [r for r in data["kotlin_pins"]
                                    if not _inside(r["project"], [folder])]
@@ -2561,6 +2607,44 @@ def _measure_reason(m):
     return None
 
 
+def last_commit(repo):
+    """When the checked-out commit was made (epoch), or None. `git log` only reads; it
+    never refreshes the index the way `git status` does."""
+    out = _git(repo, "log", "-1", "--format=%ct", "HEAD")
+    try:
+        return float(out.strip()) if out else None
+    except ValueError:
+        return None
+
+
+def project_idle(home, scan, rel, now, commits):
+    """(days its project has been idle, None) or (None, why that is not known). The
+    project is the nearest git checkout around the item, else the folder holding it.
+    Idle: no file in it changed outside .git and build output, and no commit was made."""
+    projects = scan.get("projects")
+    if projects is None:
+        return None, (f"the last scan is from an older version of {NAME}, which did not "
+                      "record when projects were last used; scan again")
+    parts = rel.split("/")[:-1]
+    ancestors = ["/".join(parts[:i]) for i in range(len(parts), 0, -1)]
+    found = next((a for a in ancestors if projects.get(a, {}).get("git")), None)
+    found = found or (ancestors[0] if ancestors and ancestors[0] in projects else None)
+    if found is None:
+        return None, "its project folder was not seen by the last scan"
+    p = projects[found]
+    if p.get("partial"):
+        return None, (f"the last scan could not see all of its project {disp(found)}, so "
+                      "it cannot tell when it was last used")
+    newest = p["newest"]
+    if p.get("git"):
+        if found not in commits:
+            commits[found] = last_commit(os.path.join(home, *found.split("/")))
+        if commits[found] is None:
+            return None, f"could not read the last commit of its git project {disp(found)}"
+        newest = max(newest, commits[found])
+    return days_since(newest, now), found
+
+
 def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
     """Rows of what `clean` would remove (remove=True) and what it leaves, with reasons.
     A container's row becomes one row per unit (see `units` in the catalog)."""
@@ -2642,7 +2726,7 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                   for row in to_measure if ENTRIES[row["id"]].units}
     measured = measure_many(home, [tuple(r["rel"].split("/")) for r in to_measure],
                             time_limit, stall_limit, units=containers)
-    unit_rows = {}
+    unit_rows, commits = {}, {}
     for row in to_measure:
         key = tuple(row["rel"].split("/"))
         m = measured[key]
@@ -2666,7 +2750,16 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                 reason = "another disk is mounted inside it"
             elif not only and row["days_unchanged"] < r["older_than_days"]:
                 reason = f"changed {row['days_unchanged']} days ago"
-            else:
+            elif not only and row["id"] in _PROJECT_IDS:
+                idle, where = project_idle(home, scan, row["rel"], now, commits)
+                if idle is None:
+                    reason = where
+                elif idle < r["older_than_days"]:
+                    reason = (f"its project {disp(where)} was in use {idle} days ago (a "
+                              "commit or a file outside .git and build output changed)")
+                else:
+                    row["project"], row["project_idle_days"] = where, idle
+            if reason is None:
                 reason = git_check(home, row["path"], m["git"])
         row["reason"] = reason
     if unit_rows:
@@ -2860,6 +2953,14 @@ def cmd_clean(args, home):
     return 0
 
 
+def _why_text(r):
+    """Why a dry-run row may go, in a few words."""
+    text = f"unchanged {r['days_unchanged']} days"
+    if r.get("project_idle_days") is not None:
+        text += f"; project {disp(r['project'])} idle {r['project_idle_days']} days"
+    return f"{text}; {r['comes_back']}"
+
+
 def _report_plan(args, scan, rows, recent):
     keep = [r for r in rows if r["remove"]]
     left = [r for r in rows if not r["remove"]]
@@ -2876,8 +2977,7 @@ def _report_plan(args, scan, rows, recent):
         print(f"Would remove {len(keep)} item{'s' if len(keep) != 1 else ''}, "
               f"{fmt_bytes(total)} in total:")
         for r in keep:
-            print(f"  {fmt_bytes(r['bytes']):>9}  {disp(r['rel'])}  "
-                  f"(unchanged {r['days_unchanged']} days; {r['comes_back']})")
+            print(f"  {fmt_bytes(r['bytes']):>9}  {disp(r['rel'])}  ({_why_text(r)})")
     else:
         print("Nothing to remove.")
     if left:

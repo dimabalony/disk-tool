@@ -14,6 +14,7 @@ import fnmatch
 import json
 import os
 import plistlib
+import re
 import shlex
 import shutil
 import stat
@@ -198,7 +199,8 @@ CATALOG = [
       "Python versions installed with pyenv. `pyenv install` brings one back."),
     E("konan", "dev", ".konan", "auto",
       "Kotlin/Native compiler downloads (the compiler, LLVM, system libraries) and its "
-      "compiled-library cache, one folder per version, each cleaned on its own. Gradle "
+      "compiled-library cache, one folder per version, each cleaned on its own. A compiler "
+      "whose Kotlin version a project's gradle/libs.versions.toml names is kept. Gradle "
       "downloads them again on the next Kotlin Multiplatform build that needs them, which "
       "can take long.", units=("", "dependencies")),
     E("rustup-toolchains", "dev", ".rustup/toolchains", "command",
@@ -518,6 +520,63 @@ _CONTAINS = {name: tuple(m for p in projects for m in p.contains)
              for name, projects in _PROJECT_BY_NAME.items()}
 _MARKER_FILES = {m for p in PROJECT_FOLDERS for m in p.next_to}  # always sent one by one
 
+# The one kind of file the tool reads: a Gradle version catalog, for the Kotlin version a
+# project pins (so `clean` keeps that Kotlin/Native compiler). Only small, local files in
+# a folder named gradle, outside ~/Library, ~/Applications and the Trash.
+VERSION_CATALOG = "libs.versions.toml"
+VERSION_CATALOG_MAX = 256 * 1024
+NO_READ_TOP = ("Library", "Applications", ".Trash")
+SF_DATALESS = 0x40000000  # a cloud file whose contents are not on this Mac
+_KOTLIN_ID = re.compile(r"""["']org\.jetbrains\.kotlin[.:]""")
+_QUOTED = r"""\s*=\s*["']([^"']+)["']"""
+
+
+def kotlin_versions(text):
+    """Kotlin versions a version catalog names: the plugins and libraries with an
+    org.jetbrains.kotlin id (version or version.ref), and a [versions] key "kotlin"."""
+    versions, found, section = {}, set(), None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            section = line.strip("[] \t").lower()
+            continue
+        if "=" not in line:
+            continue
+        key, value = (t.strip() for t in line.split("=", 1))
+        key = key.strip("\"'")
+        if section == "versions":
+            m = (re.match(r"""^["']([^"']+)["']""", value)
+                 or re.search(r"(?:strictly|require|prefer)" + _QUOTED, value))
+            if m:
+                versions[key] = m.group(1)
+                if key.lower() == "kotlin":
+                    found.add(m.group(1))
+        elif section in ("plugins", "libraries") and _KOTLIN_ID.search(value):
+            ref = re.search(r"(?:version\.ref|ref)" + _QUOTED, value)
+            direct = re.search(r"version" + _QUOTED, value)
+            if ref and ref.group(1) in versions:
+                found.add(versions[ref.group(1)])
+            elif direct:
+                found.add(direct.group(1))
+            else:
+                m = re.match(r"""^["']org\.jetbrains\.kotlin:[^:"']+:([^"']+)["']""", value)
+                if m:
+                    found.add(m.group(1))
+    return sorted(v for v in found if re.match(r"^\d+\.\d+", v))
+
+
+def _read_version_catalog(path, st):
+    if (not stat.S_ISREG(st.st_mode) or st.st_size > VERSION_CATALOG_MAX
+            or getattr(st, "st_flags", 0) & SF_DATALESS):
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return kotlin_versions(f.read(VERSION_CATALOG_MAX))
+    except OSError:
+        return []
+
 # Walked last and one at a time, so a time limit or a row of prompts costs these rather
 # than the rest: 1 = folders macOS usually guards with a privacy prompt, 2 = cloud drives.
 SLOW_AREAS = {
@@ -666,6 +725,11 @@ def walker_main(base):
                                 continue
                             size = st.st_blocks * 512
                             newest = st.st_mtime if st.st_mtime > st.st_ctime else st.st_ctime
+                            if (match and de.name == VERSION_CATALOG and rel
+                                    and rel[-1] == "gradle" and rel[0] not in NO_READ_TOP):
+                                kv = _read_version_catalog(de.path, st)
+                                if kv:
+                                    msg["kv"] = kv
                             if stat.S_ISDIR(st.st_mode):
                                 kind = 1 if st.st_dev == dev else 2  # 2: another disk
                                 markers = 0
@@ -911,6 +975,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
     private = load_private(home) if private is None else private
     private_rels = {tuple(p.split("/")) for p in private}
     items, unknown, not_measured, seen, no_answer = {}, {}, [], set(), []
+    pins = []  # Kotlin versions projects name in gradle/libs.versions.toml
     stats = {"folders": 0, "bytes": 0, "shown": t0}
 
     def anchor(name):
@@ -950,6 +1015,8 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
             stats["bytes"] += total
             return {}
         rows, names, subs = msg["e"], None, {}
+        for version in msg.get("kv") or ():
+            pins.append({"version": version, "project": "/".join(rel[:-1])})
         for name, kind, size, newest, link, markers in rows:
             crel = rel + (name,)
             if kind == 2:
@@ -1079,6 +1146,7 @@ def scan_home(home, time_limit, stall_limit=None, progress=False, root=None, pri
         "private": sorted(private),
         "kinds": {k: sum(r["bytes"] for r in records if r["kind"] == k) for k in KINDS},
         "not_measured": sorted(not_measured, key=lambda r: r["rel"]),
+        "kotlin_pins": sorted(pins, key=lambda r: (r["version"], r["project"])),
         "items": records,
     }
 
@@ -1397,7 +1465,8 @@ def scan_view(result, changes, top):
             "items_total": len(rows),
         }
     blocked = result["not_measured"]
-    view = {k: v for k, v in result.items() if k not in ("items", "kinds", "not_measured")}
+    view = {k: v for k, v in result.items()
+            if k not in ("items", "kinds", "not_measured", "kotlin_pins")}
     view["outside"] = result.get("outside", {"scanned": False})
     view["kinds"] = kinds
     view["not_measured"] = [{k: v for k, v in r.items() if k != "names"}
@@ -2257,6 +2326,9 @@ def scrub_saved(home, folder):
                 r.pop("names", None)  # names inside it; without them the whole is unknown
         data["not_reached"] = [r for r in data.get("not_reached", [])
                                if not r["rel"].startswith(folder + "/")]
+        if "kotlin_pins" in data:
+            data["kotlin_pins"] = [r for r in data["kotlin_pins"]
+                                   if not _inside(r["project"], [folder])]
         _write_json(path, data)
     scrub_change_log(home, folder)
     policy = _read_json(policy_path(home))
@@ -2583,7 +2655,7 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
                 reason = "another disk is mounted inside it"
             else:
                 unit_rows[row["rel"]] = _unit_rows(home, row, r, m["units"], only, now,
-                                                   blocking, recent)
+                                                   blocking, recent, pin_check(scan))
                 reason = "a container: its parts are judged one by one"
         elif reason is None:
             row["bytes"] = m["bytes"]
@@ -2604,7 +2676,38 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
     return rows, recent
 
 
-def _unit_rows(home, row, rule, units, only, now, blocking, recent):
+KONAN_COMPILER = re.compile(r"^kotlin-native(?:-prebuilt)?-(?:macos|linux|windows|mingw)"
+                            r"(?:-(?:aarch64|arm64|x86_64|x64))?-(\d[\w.+-]*)$")
+
+
+def pin_check(scan):
+    """A test for one unit of a container: why a project still needs it, or None. Today
+    only Kotlin/Native compilers (~/.konan) that a version catalog names."""
+    pins = {}
+    for p in scan.get("kotlin_pins") or ():
+        pins.setdefault(p["version"], p["project"])
+
+    def test(entry_id, key):
+        if entry_id != "konan":
+            return None
+        m = KONAN_COMPILER.match(key[-1])
+        if not m:
+            return None
+        version = m.group(1)
+        if "kotlin_pins" not in scan:
+            return (f"Kotlin {version}: the last scan is from an older version of {NAME}, "
+                    "which did not look for projects that use it; scan again")
+        if version in pins:
+            where = disp("/".join(x for x in (pins[version], "gradle", VERSION_CATALOG) if x))
+            return f"Kotlin {version} is named in {where}"
+        if not scan.get("complete"):
+            return (f"Kotlin {version}: the last scan did not see every folder, so a "
+                    "project that uses it may have been missed")
+        return None
+    return test
+
+
+def _unit_rows(home, row, rule, units, only, now, blocking, recent, pinned):
     """One row per unit of a container. Units that changed recently are only counted."""
     out = []
     for key in sorted(units, key=lambda k: -units[k]["bytes"]):
@@ -2622,6 +2725,8 @@ def _unit_rows(home, row, rule, units, only, now, blocking, recent):
                 recent["count"] += 1
                 recent["bytes"] += m["bytes"]
                 continue
+            elif pinned(row["id"], key):
+                reason = pinned(row["id"], key)
             else:
                 found = blocking(rel)
                 if found:

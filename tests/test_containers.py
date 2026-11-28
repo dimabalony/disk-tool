@@ -102,6 +102,92 @@ class ContainerTest(HomeTestCase):
         self.assertIn("uncommitted changes", left["Library/Caches/JetBrains/IdeaIC2023.1"])
 
 
+class KotlinPinTest(HomeTestCase):
+    """~/.konan: a Kotlin/Native version a project's version catalog names is kept."""
+
+    def setUp(self):
+        super().setUp()
+        self.shift_clock(40)
+        for v in ("1.9.0", "2.0.0"):
+            self.write(f".konan/kotlin-native-prebuilt-macos-aarch64-{v}/bin/konanc")
+        self.run_tool("policy", "init")
+        self.run_tool("policy", "set", "konan", "clean", "--older-than-days", "30")
+
+    def catalog(self, rel, text):
+        path = self.write(rel, 0)
+        with open(path, "w") as f:
+            f.write(text)
+
+    def plan(self):
+        rc, out = self.run_tool("clean", "--json")
+        self.assertEqual(rc, 0, out)
+        data = json.loads(out)
+        return ([r["rel"] for r in data["remove"]],
+                {r["rel"]: r["reason"] for r in data["left_alone"]})
+
+    def test_a_pinned_version_stays_and_says_why(self):
+        self.catalog("Developer/app/gradle/libs.versions.toml",
+                     '[versions]\nkotlin = "2.0.0"\n[plugins]\n'
+                     'kmp = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }\n')
+        self.run_tool("scan")
+        remove, left = self.plan()
+        self.assertEqual(remove, [".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"])
+        self.assertEqual(left[".konan/kotlin-native-prebuilt-macos-aarch64-2.0.0"],
+                         "Kotlin 2.0.0 is named in ~/Developer/app/gradle/libs.versions.toml")
+        rc, out = self.run_tool("clean")
+        self.assertIn("Kotlin 2.0.0 is named in", out)
+        rc, out = self.run_tool("clean", "--apply")
+        self.assertTrue(self.exists(".konan/kotlin-native-prebuilt-macos-aarch64-2.0.0"))
+        self.assertFalse(self.exists(".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"))
+
+    def exists(self, rel):
+        import os
+        return os.path.lexists(os.path.join(self.home, rel))
+
+    def test_catalogs_in_library_are_not_read(self):
+        self.catalog("Library/Mobile Documents/app/gradle/libs.versions.toml",
+                     '[versions]\nkotlin = "2.0.0"\n')
+        self.run_tool("scan")
+        remove, _left = self.plan()
+        self.assertEqual(len(remove), 2)
+
+    def test_a_scan_from_before_pins_or_an_incomplete_one_keeps_compilers(self):
+        self.run_tool("scan")
+        path = self.tool.state_dir(self.home) + "/latest.json"
+        with open(path) as f:
+            data = json.load(f)
+        data["complete"] = False
+        with open(path, "w") as f:
+            json.dump(data, f)
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("may have been missed",
+                      left[".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"])
+        del data["kotlin_pins"]
+        with open(path, "w") as f:
+            json.dump(data, f)
+        remove, left = self.plan()
+        self.assertEqual(remove, [])
+        self.assertIn("scan again", left[".konan/kotlin-native-prebuilt-macos-aarch64-1.9.0"])
+
+    def test_private_folders_hide_their_catalogs(self):
+        self.catalog("Work/app/gradle/libs.versions.toml", '[versions]\nkotlin = "2.0.0"\n')
+        self.run_tool("private", "add", "~/Work")
+        self.run_tool("scan")
+        with open(self.tool.state_dir(self.home) + "/latest.json") as f:
+            self.assertEqual(json.load(f)["kotlin_pins"], [])
+
+    def test_parser(self):
+        text = (
+            '# comment\n[versions]\nkgp = { strictly = "1.9.24" }\ncoroutines = "1.8.1"\n'
+            '[libraries]\n'
+            'co = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }\n'
+            'kgp = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kgp" }\n'
+            'std = "org.jetbrains.kotlin:kotlin-stdlib:1.8.0"\n'
+            '[plugins]\nkmp = { id = "org.jetbrains.kotlin.multiplatform", version = "2.1.0" }\n')
+        self.assertEqual(self.tool.kotlin_versions(text), ["1.8.0", "1.9.24", "2.1.0"])
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()

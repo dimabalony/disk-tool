@@ -74,11 +74,14 @@ RETURNS = {
     "no": "does not come back",
 }
 
-Entry = namedtuple("Entry", "id kind pattern returns description auto_clean protected")
+Entry = namedtuple("Entry", "id kind pattern returns description auto_clean protected units "
+                           "opt_in default_days")
 
 
-def E(id, kind, pattern, returns, description, auto_clean=False, protected=False):
-    return Entry(id, kind, pattern, returns, description, auto_clean, protected)
+def E(id, kind, pattern, returns, description, auto_clean=False, protected=False, units=None,
+      opt_in=False, default_days=None):
+    return Entry(id, kind, pattern, returns, description, auto_clean, protected,
+                 tuple(units) if units else None, opt_in, default_days)
 
 
 # One row per thing the tool recognises.
@@ -88,6 +91,11 @@ def E(id, kind, pattern, returns, description, auto_clean=False, protected=False
 #   returns     auto | command | no: whether it comes back after removal (see RETURNS).
 #   auto_clean  `policy init` proposes `clean` after 30 days unused. Caches only.
 #   protected   never removed by this tool; the description says what to do instead.
+#   units       a container: `clean` judges and removes each folder inside it on its own.
+#               Each value is a folder under the row ("" = the row itself) whose direct
+#               subfolders are the units, such as one compiler version each. A unit goes when
+#               nothing in it changed for the rule's days; the rest stays. Files directly in
+#               the row or in a listed folder are never removed.
 CATALOG = [
     # cache
     E("library-caches", "cache", "Library/Caches/*", "auto",
@@ -103,10 +111,11 @@ CATALOG = [
     E("go-build-cache", "cache", "Library/Caches/go-build", "auto",
       "Go build cache. The next build fills it again.", auto_clean=True),
     E("swiftpm-cache", "cache", "Library/Caches/org.swift.swiftpm", "auto",
-      "Swift Package Manager download cache.", auto_clean=True),
+      "Swift Package Manager download cache. Each package is cleaned on its own.",
+      auto_clean=True, units=("", "repositories", "artifacts")),
     E("jetbrains-cache", "cache", "Library/Caches/JetBrains", "auto",
-      "JetBrains IDE caches and indexes. The IDE rebuilds them (the first start is slower).",
-      auto_clean=True),
+      "JetBrains IDE caches and indexes, one folder per IDE version, each cleaned on its own. "
+      "The IDE rebuilds them (the first start is slower).", auto_clean=True, units=("",)),
     E("chrome-cache", "cache", "Library/Caches/Google", "auto",
       "Google Chrome's cache.", auto_clean=True),
     E("safari-cache", "cache", "Library/Caches/com.apple.Safari", "auto",
@@ -120,7 +129,8 @@ CATALOG = [
     E("app-container-cache", "cache", "Library/Containers/*/Data/Library/Caches", "auto",
       "Cache of a sandboxed app. The app rebuilds it.", auto_clean=True),
     E("xcode-derived-data", "cache", "Library/Developer/Xcode/DerivedData", "auto",
-      "Xcode build files. Xcode rebuilds them on the next build.", auto_clean=True),
+      "Xcode build files, one folder per project, each cleaned on its own. Xcode rebuilds "
+      "them on the next build.", auto_clean=True, units=("",)),
     E("simulator-caches", "cache", "Library/Developer/CoreSimulator/Caches", "auto",
       "Simulator caches. The simulator rebuilds them.", auto_clean=True),
     E("npm-cache", "cache", ".npm/_cacache", "auto",
@@ -147,8 +157,8 @@ CATALOG = [
       "Gradle dependency and build cache. The next build downloads again what it needs.",
       auto_clean=True),
     E("gradle-wrapper", "cache", ".gradle/wrapper/dists", "auto",
-      "Gradle versions downloaded by projects. Downloaded again when a project needs one.",
-      auto_clean=True),
+      "Gradle versions downloaded by projects, each cleaned on its own. Downloaded again "
+      "when a project needs one.", auto_clean=True, units=("",)),
     E("maven-repo", "cache", ".m2/repository", "auto",
       "Maven dependency cache. The next build downloads again what it needs.", auto_clean=True),
     E("cargo-registry", "cache", ".cargo/registry", "auto",
@@ -188,8 +198,9 @@ CATALOG = [
       "Python versions installed with pyenv. `pyenv install` brings one back."),
     E("konan", "dev", ".konan", "auto",
       "Kotlin/Native compiler downloads (the compiler, LLVM, system libraries) and its "
-      "compiled-library cache. Gradle downloads them again on the next Kotlin Multiplatform "
-      "build that needs them, which can take long."),
+      "compiled-library cache, one folder per version, each cleaned on its own. Gradle "
+      "downloads them again on the next Kotlin Multiplatform build that needs them, which "
+      "can take long.", units=("", "dependencies")),
     E("rustup-toolchains", "dev", ".rustup/toolchains", "command",
       "Rust toolchains. `rustup toolchain install` brings one back."),
     E("huggingface", "dev", ".cache/huggingface", "command",
@@ -2297,14 +2308,46 @@ def cmd_private(args, home):
 
 # ----------------------------------------------------------------------------- clean
 
-def measure_many(home, rels, time_limit, stall_limit):
-    """Size, newest change and git folders of items, read by the child walker."""
+def _blank_measure():
+    return {"bytes": 0, "newest": 0.0, "unreadable": False, "mount": False, "timeout": False,
+            "missing": False, "link": False, "no_answer": False, "git": []}
+
+
+def unit_of(container, parents, rel):
+    """The unit folder (a tuple under home) that `rel` is in or is, for a container at
+    `container` whose units sit in `parents` (tuples under it). None for the container
+    itself, a listed folder, or anything else that belongs to no unit."""
+    inside = rel[len(container):]
+    best = None
+    for q in parents:
+        if len(inside) > len(q) and inside[:len(q)] == q and (best is None or len(q) > len(best)):
+            best = q
+    if best is None:
+        return None
+    unit = inside[:len(best) + 1]
+    return None if unit in parents else container + unit
+
+
+def measure_many(home, rels, time_limit, stall_limit, units=None):
+    """Size, newest change and git folders of items, read by the child walker. For a
+    container (units: {rel: unit parents}), also the same per unit, under "units"."""
+    units = {r: {tuple(q.split("/")) if q else () for q in qs}
+             for r, qs in (units or {}).items()}
     deadline = time.monotonic() + time_limit
-    res = {r: {"bytes": 0, "newest": 0.0, "unreadable": False, "mount": False,
-               "timeout": False, "missing": False, "link": False, "no_answer": False,
-               "git": []} for r in rels}
+    res = {r: _blank_measure() for r in rels}
+    for r in units:
+        res[r]["units"] = {}
     seen = {r: set() for r in rels}
     todo = sorted(set(rels))
+
+    def part(root, rel, is_dir=True):
+        """Where a path's numbers go: its unit, or the item as a whole."""
+        if root in units:
+            u = unit_of(root, units[root], rel)
+            if u is not None and (is_dir or len(rel) > len(u)):
+                return res[root]["units"].setdefault(u, _blank_measure())
+        return res[root]
+
     while todo:
         # An item inside another item is measured in a later round, on its own.
         batch = [r for r in todo if not any(o != r and r[:len(o)] == o for o in todo)]
@@ -2320,36 +2363,41 @@ def measure_many(home, rels, time_limit, stall_limit):
                 m["mount"] = m["mount"] or kind == "other-disk"
             if "err" in msg:
                 if msg["err"] != "gone":
-                    m["unreadable"] = True
+                    part(root, rel)["unreadable"] = True
                 elif rel == root:
                     m["missing"] = True
                 return {}
             subs = {}
             for name, kind, size, newest, link, _markers in msg.get("e") or ():
+                crel = rel + (name,)
+                p = part(root, crel, kind != 0)
                 if name == ".git":
-                    m["git"].append(os.path.join(home, *rel))
+                    part(root, rel)["git"].append(os.path.join(home, *rel))
                 if kind == 2:
-                    m["mount"] = True
+                    p["mount"] = True
                     continue
                 if link:
                     key = tuple(link)
                     size = 0 if key in seen[root] else size
                     seen[root].add(key)
-                m["bytes"] += size
-                m["newest"] = max(m["newest"], newest)
+                for t in ((m, p) if p is not m else (m,)):
+                    t["bytes"] += size
+                    t["newest"] = max(t["newest"], newest)
                 if kind == 1:
                     subs[name] = root
             if "f" in msg:
-                m["bytes"] += msg["f"][0]
-                m["newest"] = max(m["newest"], msg["f"][1])
+                p = part(root, rel + ("(files)",), False)
+                for t in ((m, p) if p is not m else (m,)):
+                    t["bytes"] += msg["f"][0]
+                    t["newest"] = max(t["newest"], msg["f"][1])
             return subs
 
         def on_no_answer(rel, root, why, _waited):
-            res[root]["no_answer" if why == "no-answer" else "unreadable"] = True
+            part(root, rel)["no_answer" if why == "no-answer" else "unreadable"] = True
 
         def on_skipped(_parent, rows, _why):
-            for _rel, root in rows:
-                res[root]["no_answer"] = True
+            for rel, root in rows:
+                part(root, rel)["no_answer"] = True
 
         timed_out, _pending = walk(home, {r: r for r in batch}, on_listing,
                                    max(0.0, deadline - time.monotonic()), stall_limit,
@@ -2362,13 +2410,14 @@ def measure_many(home, rels, time_limit, stall_limit):
     return res
 
 
-def check_path(home, path):
-    """Why this path must not be removed, or None. Re-checked right before removal."""
+def check_path(home, path, container=False):
+    """Why this path must not be removed, or None. Re-checked right before removal.
+    container: only parts inside it are removed, so a top-level folder is fine."""
     home = os.path.realpath(home)
     rel = os.path.relpath(path, home)
     if os.path.isabs(rel) or rel == "." or rel.startswith(".." + os.sep) or rel == "..":
         return "outside your home folder"
-    if len(rel.split(os.sep)) < 2:
+    if len(rel.split(os.sep)) < 2 and not container:
         return "a top-level folder of your home; never removed"
     try:
         st = os.lstat(path)
@@ -2429,8 +2478,20 @@ def git_check(home, path, git_dirs):
     return None
 
 
+def _measure_reason(m):
+    """Why a measured item (or unit) cannot be removed, before age, or None."""
+    if m["no_answer"]:
+        return "macOS did not answer while checking it (privacy prompt?)"
+    if m["timeout"]:
+        return "ran out of time checking it"
+    if m["missing"]:
+        return "already gone"
+    return None
+
+
 def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
-    """Rows of what `clean` would remove (remove=True) and what it leaves, with reasons."""
+    """Rows of what `clean` would remove (remove=True) and what it leaves, with reasons.
+    A container's row becomes one row per unit (see `units` in the catalog)."""
     now = _now()
     stall_limit = STALL_LIMIT if stall_limit is None else stall_limit
     private = sorted(set(load_private(home)) | set(scan.get("private", [])))
@@ -2443,6 +2504,16 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
             entry = ENTRIES.get(rec["id"], UNKNOWN)
             rules[rec["rel"]] = (entry, rule_for(policy, entry, rec["rel"]))
         return rules[rec["rel"]]
+
+    def blocking(rel):
+        """A record inside `rel` that this clean must not remove with it, or None."""
+        for other in records.values():
+            if other["rel"].startswith(rel + "/"):
+                o_entry, o_rule = rule(other)
+                if o_entry.kind in NEVER_CLEAN or o_entry.protected or (
+                        o_rule["action"] != "clean" and not only) or o_rule["action"] == "keep":
+                    return other, o_entry
+        return None
 
     targets, recent = [], {"count": 0, "bytes": 0}
     if only:
@@ -2460,7 +2531,8 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
             entry, r = rule(rec)
             if r["action"] != "clean":
                 continue
-            if days_since(rec["last_changed_epoch"] or now, now) < r["older_than_days"]:
+            if (not entry.units and
+                    days_since(rec["last_changed_epoch"] or now, now) < r["older_than_days"]):
                 recent["count"] += 1
                 recent["bytes"] += rec["bytes"]
                 continue
@@ -2486,32 +2558,34 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
             reason = "your policy says keep"
         elif any(f.startswith(rec["rel"] + "/") for f in private):
             reason = "it holds a private folder"
-        if reason is None:
-            for other in records.values():
-                if other["rel"].startswith(rec["rel"] + "/"):
-                    o_entry, o_rule = rule(other)
-                    if o_entry.kind in NEVER_CLEAN or o_entry.protected or (
-                            o_rule["action"] != "clean" and not only) or o_rule["action"] == "keep":
-                        reason = (f"it holds {disp(other['rel'])} ({o_entry.kind}), "
-                                  f"which your policy does not clean")
-                        break
+        if reason is None and not entry.units:
+            found = blocking(rec["rel"])
+            if found:
+                reason = (f"it holds {disp(found[0]['rel'])} ({found[1].kind}), "
+                          f"which your policy does not clean")
         row["reason"] = reason
         if reason is None:
             to_measure.append(row)
+    containers = {tuple(row["rel"].split("/")): ENTRIES[row["id"]].units
+                  for row in to_measure if ENTRIES[row["id"]].units}
     measured = measure_many(home, [tuple(r["rel"].split("/")) for r in to_measure],
-                            time_limit, stall_limit)
+                            time_limit, stall_limit, units=containers)
+    unit_rows = {}
     for row in to_measure:
-        m = measured[tuple(row["rel"].split("/"))]
+        key = tuple(row["rel"].split("/"))
+        m = measured[key]
         r = rule(records[row["rel"]])[1]
-        if m["no_answer"]:
-            reason = "macOS did not answer while checking it (privacy prompt?)"
-        elif m["timeout"]:
-            reason = "ran out of time checking it"
-        elif m["missing"]:
-            reason = "already gone"
-        else:
-            reason = check_path(home, row["path"])
-        if reason is None:
+        reason = _measure_reason(m) or check_path(home, row["path"], key in containers)
+        if reason is None and key in containers:
+            if m["unreadable"]:
+                reason = "could not look inside all of it"
+            elif m["mount"]:
+                reason = "another disk is mounted inside it"
+            else:
+                unit_rows[row["rel"]] = _unit_rows(home, row, r, m["units"], only, now,
+                                                   blocking, recent)
+                reason = "a container: its parts are judged one by one"
+        elif reason is None:
             row["bytes"] = m["bytes"]
             row["days_unchanged"] = days_since(m["newest"], now)
             if m["unreadable"]:
@@ -2523,9 +2597,41 @@ def build_plan(home, scan, policy, only, time_limit, stall_limit=None):
             else:
                 reason = git_check(home, row["path"], m["git"])
         row["reason"] = reason
+    if unit_rows:
+        rows = [u for row in rows for u in unit_rows.get(row["rel"], [row])]
     for row in rows:
         row["remove"] = row["reason"] is None
     return rows, recent
+
+
+def _unit_rows(home, row, rule, units, only, now, blocking, recent):
+    """One row per unit of a container. Units that changed recently are only counted."""
+    out = []
+    for key in sorted(units, key=lambda k: -units[k]["bytes"]):
+        m = units[key]
+        rel = "/".join(key)
+        unit = dict(row, rel=rel, path=os.path.join(home, *key), bytes=m["bytes"],
+                    days_unchanged=days_since(m["newest"], now), part_of=row["rel"])
+        reason = _measure_reason(m) or check_path(home, unit["path"])
+        if reason is None:
+            if m["unreadable"]:
+                reason = "could not look inside all of it"
+            elif m["mount"]:
+                reason = "another disk is mounted inside it"
+            elif not only and unit["days_unchanged"] < rule["older_than_days"]:
+                recent["count"] += 1
+                recent["bytes"] += m["bytes"]
+                continue
+            else:
+                found = blocking(rel)
+                if found:
+                    reason = (f"it holds {disp(found[0]['rel'])} ({found[1].kind}), "
+                              f"which your policy does not clean")
+                else:
+                    reason = git_check(home, unit["path"], m["git"])
+        unit["reason"] = reason
+        out.append(unit)
+    return out
 
 
 def _plan_file(home):
